@@ -594,8 +594,71 @@ def _get_query_param_value(key: str) -> str | None:
     return s if s else None
 
 def _handle_app_actions() -> None:
-    # Logout disabilitato (richiesta utente)
-    return
+
+def _render_floating_logout_button() -> None:
+    """Pulsante logout non invasivo (in alto a destra) visibile solo dentro l'app."""
+    try:
+        if not st.session_state.get("auth_logged_in"):
+            return
+    except Exception:
+        return
+
+    # Stile minimal e non invasivo
+    st.markdown(
+        """<style>
+        .uw-logout { position: fixed; top: 10px; right: 14px; z-index: 99999; }
+        .uw-logout a{
+            display:inline-block; padding:6px 10px; border-radius: 10px;
+            font-size: 12px; text-decoration:none;
+            border: 1px solid rgba(0,0,0,0.15);
+            background: rgba(255,255,255,0.85);
+            color: rgba(0,0,0,0.75);
+        }
+        .uw-logout a:hover{
+            background: rgba(255,255,255,1.0);
+            color: rgba(0,0,0,0.9);
+            border-color: rgba(0,0,0,0.25);
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+    # Link-azione: viene gestito da _handle_app_actions all'inizio del run successivo
+    st.markdown('<div class="uw-logout"><a href="?action=logout">Logout</a></div>', unsafe_allow_html=True)
+
+_render_floating_logout_button()
+
+    """Gestisce azioni via query params (es. logout)."""
+    action = _get_query_param_value("action")
+    if not action:
+        return
+    if str(action).strip().lower() == "logout":
+        # Reset sessione auth (locale o OIDC) + pulizia query params
+        try:
+            for k in ("auth_logged_in", "auth_user", "auth_token"):
+                if k in st.session_state:
+                    st.session_state.pop(k, None)
+        except Exception:
+            pass
+
+        # Pulizia query params (compatibile vecchie API)
+        try:
+            # Nuova API (st.query_params)
+            st.query_params.clear()
+        except Exception:
+            try:
+                st.experimental_set_query_params()
+            except Exception:
+                pass
+
+        # Se presente, esegue logout OIDC (non necessario in locale, ma innocuo se non supportato)
+        try:
+            if hasattr(st, "logout"):
+                st.logout()
+        except Exception:
+            pass
+
+        st.rerun()
 
 _handle_app_actions()
 
