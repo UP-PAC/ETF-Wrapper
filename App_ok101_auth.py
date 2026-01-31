@@ -329,13 +329,13 @@ def _resolve_user_id() -> str:
     st.stop()
 
 
-# Storage per-utente (filesystem, backend provvisorio)
-from pathlib import Path
-_USER_ID = _resolve_user_id()
+    # Storage per-utente (filesystem, backend provvisorio)
+    from pathlib import Path
+    _USER_ID = _resolve_user_id()
 
-# =======================
-# Action handler (query params) – es. logout
-# =======================
+    # =======================
+    # Action handler (query params) – es. logout
+    # =======================
 def _get_query_param_value(key: str) -> str | None:
     """Ritorna il valore di un query-param come stringa (compatibile vecchie API)."""
     try:
