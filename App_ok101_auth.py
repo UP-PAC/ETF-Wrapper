@@ -108,6 +108,91 @@ if not AUTH_MODE:
     AUTH_MODE = "local"
 
 
+
+# =======================
+# Local auth persistence (signed token in query params)
+# Obiettivo: evitare nuove richieste di login quando la navigazione usa link (?main=...)
+# =======================
+import hashlib as _hashlib
+import time as _time
+import base64 as _base64
+import urllib.parse as _urlparse
+
+def _get_local_auth_secret() -> bytes:
+    """Segreto per firmare i token di persistenza (env/secrets)."""
+    try:
+        s = None
+        if hasattr(st, "secrets"):
+            s = st.secrets.get("UW_AUTH_SECRET", None)
+        if not s:
+            s = os.getenv("UW_AUTH_SECRET", None)
+        if not s:
+            # fallback: non ideale ma evita crash in demo locale
+            s = "uw-local-dev-secret"
+        return str(s).encode("utf-8")
+    except Exception:
+        return b"uw-local-dev-secret"
+
+def _make_local_auth_token(user: str, ttl_days: int = 7) -> str:
+    """Crea un token firmato (base64url) valido per ttl_days."""
+    user = (user or "").strip()
+    ts = int(_time.time())
+    payload = f"{user}|{ts}"
+    sig = hmac.new(_get_local_auth_secret(), payload.encode("utf-8"), digestmod=_hashlib.sha256).hexdigest()
+    raw = f"{payload}|{sig}".encode("utf-8")
+    return _base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+def _validate_local_auth_token(user: str, token: str, ttl_days: int = 7) -> bool:
+    """Valida token firmato e scadenza."""
+    try:
+        if not user or not token:
+            return False
+        pad = "=" * (-len(token) % 4)
+        raw = _base64.urlsafe_b64decode((token + pad).encode("utf-8")).decode("utf-8")
+        parts = raw.split("|")
+        if len(parts) != 3:
+            return False
+        u, ts_str, sig = parts
+        if str(u) != str(user):
+            return False
+        payload = f"{u}|{ts_str}"
+        expected = hmac.new(_get_local_auth_secret(), payload.encode("utf-8"), digestmod=_hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(str(sig), str(expected)):
+            return False
+        ts = int(ts_str)
+        if ts <= 0:
+            return False
+        age = int(_time.time()) - ts
+        return age <= int(ttl_days) * 24 * 3600
+    except Exception:
+        return False
+
+def _restore_local_auth_from_query_params() -> None:
+    """Se nei query params ci sono uwu/uwt validi, ripristina l'autenticazione locale."""
+    try:
+        if st.session_state.get("auth_logged_in") and st.session_state.get("auth_user"):
+            return
+        try:
+            qp = st.query_params
+            uwu = qp.get("uwu", None)
+            uwt = qp.get("uwt", None)
+        except Exception:
+            qp = st.experimental_get_query_params()
+            uwu = qp.get("uwu", [None])
+            uwt = qp.get("uwt", [None])
+        if isinstance(uwu, list):
+            uwu = uwu[0] if uwu else None
+        if isinstance(uwt, list):
+            uwt = uwt[0] if uwt else None
+        uwu = str(uwu).strip() if uwu else ""
+        uwt = str(uwt).strip() if uwt else ""
+        if uwu and uwt and _validate_local_auth_token(uwu, uwt):
+            st.session_state["auth_logged_in"] = True
+            st.session_state["auth_user"] = uwu
+            st.session_state["auth_token"] = uwt
+    except Exception:
+        pass
+
 def _get_auth_provider() -> str | None:
     try:
         p = st.secrets.get("app", {}).get("auth_provider", None)
@@ -237,6 +322,17 @@ def _render_local_auth_page() -> None:
                 if _verify_pwd(pwd, rec.get("pwd_hash", ""), rec.get("pwd_salt", "")):
                     st.session_state["auth_logged_in"] = True
                     st.session_state["auth_user"] = u
+                    tok = _make_local_auth_token(u)
+                    st.session_state["auth_token"] = tok
+                    # Propaga token nei query params per mantenere la sessione anche su navigazione via link
+                    try:
+                        st.query_params["uwu"] = u
+                        st.query_params["uwt"] = tok
+                    except Exception:
+                        try:
+                            st.experimental_set_query_params(uwu=u, uwt=tok)
+                        except Exception:
+                            pass
                     st.success("Accesso effettuato.")
                     st.rerun()
                 else:
@@ -300,6 +396,7 @@ def _resolve_user_id() -> str:
 
     # --- Local auth (username/password) ---
     if mode == "local":
+        _restore_local_auth_from_query_params()
         # Se già loggato, ritorna subito l'utente
         if st.session_state.get("auth_logged_in") and st.session_state.get("auth_user"):
             return str(st.session_state.get("auth_user"))
@@ -497,24 +594,8 @@ def _get_query_param_value(key: str) -> str | None:
     return s if s else None
 
 def _handle_app_actions() -> None:
-    # Logout richiesto dalla navbar (solo in PROD)
-    action = _get_query_param_value("action")
-    # Logout in modalità LOCAL
-    if APP_MODE == "prod" and str(globals().get('AUTH_MODE','local')).lower() == "local" and action == "logout":
-        st.session_state["auth_logged_in"] = False
-        st.session_state["auth_user"] = None
-        st.session_state.pop("auth_name", None)
-        st.session_state.pop("auth_surname", None)
-        st.session_state.pop("auth_address", None)
-        st.experimental_set_query_params()  # pulisce i parametri
-        st.rerun()
-    if APP_MODE == "prod" and action == "logout":
-        # st.logout() avvia una nuova sessione e torna alla home
-        try:
-            st.logout()
-        except Exception:
-            pass
-        st.stop()
+    # Logout disabilitato (richiesta utente)
+    return
 
 _handle_app_actions()
 
@@ -986,76 +1067,76 @@ NAVBAR_HTML_TEMPLATE = """
       <div class="uw-menus">
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Clienti%2FInvestitori" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Clienti%2FInvestitori" target="_self">
             Clienti/Investitori <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Clienti%2FInvestitori" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Clienti%2FInvestitori" target="_self">
               <b>Anagrafica</b><span>Gestione profili e dati cliente</span>
             </a>
           </div>
         </div>
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Crea%20Soluzione%20di%20Investimento" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento" target="_self">
             Crea Soluzione di Investimento <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Crea%20Soluzione%20di%20Investimento&crea=Asset-Only" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento&crea=Asset-Only" target="_self">
               <b>Asset-Only</b><span>Asset Allocation, Life Cycle, Monte Carlo</span>
             </a>
-            <a class="uw-dd-item" href="?main=Crea%20Soluzione%20di%20Investimento&crea=Goal-Based%20Investing" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento&crea=Goal-Based%20Investing" target="_self">
               <b>Goal-Based Investing</b><span>Soluzioni dinamiche per obiettivi</span>
             </a>
           </div>
         </div>
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Selezione%20Prodotti" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Selezione%20Prodotti" target="_self">
             Selezione Prodotti <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Selezione%20Prodotti" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Selezione%20Prodotti" target="_self">
               <b>Selezione Prodotti</b><span>Scelta degli strumenti per l’allocazione</span>
             </a>
           </div>
         </div>
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Monitoraggio%20Portafoglio" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Monitoraggio%20Portafoglio" target="_self">
             Monitoraggio Portafoglio <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Monitoraggio%20Portafoglio" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Monitoraggio%20Portafoglio" target="_self">
               <b>Monitoraggio Portafoglio</b><span>Andamento, scostamenti e alert di controllo</span>
             </a>
           </div>
         </div>
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Analisi%20Asset%20Allocation" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Analisi%20Asset%20Allocation" target="_self">
             Analisi Asset Allocation <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Analisi%20Asset%20Allocation" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Analisi%20Asset%20Allocation" target="_self">
               <b>Analisi Asset Allocation</b><span>Backtesting, rischio/rendimento, indicatori</span>
             </a>
           </div>
         </div>
 <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Tools&tools=Griglie%20Clientela" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Tools&tools=Griglie%20Clientela" target="_self">
             Tools <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Tools&tools=Griglie%20Clientela" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Griglie%20Clientela" target="_self">
               <b>Griglie Clientela</b><span>Profili e griglie obiettivo/rischio</span>
             </a>
-            <a class="uw-dd-item" href="?main=Tools&tools=Portafogli%20in%20Asset%20Class" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Portafogli%20in%20Asset%20Class" target="_self">
               <b>Portafogli in Asset Class</b><span>Frontiera e portafogli caricati</span>
             </a>
-            <a class="uw-dd-item" href="?main=Tools&tools=Database%20Prodotti" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Database%20Prodotti" target="_self">
               <b>Database Prodotti</b><span>Upload universo ETF/fondi e metriche</span>
             </a>
-            <a class="uw-dd-item" href="?main=Tools&tools=Database%20Mercati" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Database%20Mercati" target="_self">
               <b>Database Mercati</b><span>Upload rendimenti e controlli qualità</span>
             </a>
           </div>
@@ -1134,18 +1215,41 @@ def _build_logo_html() -> str:
 def render_navbar() -> None:
     """Render della navbar premium.
     Usa st.html (Streamlit recente) se disponibile; altrimenti fallback su st.markdown unsafe.
+
+    Nota: per AUTH_MODE='local' la navbar usa link con query params; per evitare nuove richieste di login
+    propaghiamo (se presente) il token firmato uwu/uwt nei link.
     """
-    logout_html = ""
-    if APP_MODE == "prod":
-        try:
-            if bool(getattr(st.user, "is_logged_in", False)):
-                logout_html = '<a class="uw-logout" href="?action=logout" target="_self">Logout</a>'
-        except Exception:
-            pass
+    logout_html = ""  # logout disabilitato (richiesta utente)
+
+    # Prefisso querystring per persistenza auth locale (se disponibile)
+    auth_qs = ""
+    try:
+        if APP_MODE == "prod" and str(globals().get("AUTH_MODE", "local")).strip().lower() == "local":
+            import urllib.parse as _urlparse
+            try:
+                qp = st.query_params
+                uwu = qp.get("uwu", None)
+                uwt = qp.get("uwt", None)
+            except Exception:
+                qp = st.experimental_get_query_params()
+                uwu = qp.get("uwu", [None])
+                uwt = qp.get("uwt", [None])
+            if isinstance(uwu, list):
+                uwu = uwu[0] if uwu else None
+            if isinstance(uwt, list):
+                uwt = uwt[0] if uwt else None
+
+            uwu = (uwu or st.session_state.get("auth_user") or "").strip()
+            uwt = (uwt or st.session_state.get("auth_token") or "").strip()
+
+            if uwu and uwt:
+                auth_qs = f"uwu={_urlparse.quote(str(uwu))}&uwt={_urlparse.quote(str(uwt))}&"
+    except Exception:
+        auth_qs = ""
 
     avatar_txt = _avatar_initials_from_user()
     logo_html = _build_logo_html()
-    html = NAVBAR_HTML_TEMPLATE.format(logout_html=logout_html, avatar_txt=avatar_txt, logo_html=logo_html)
+    html = NAVBAR_HTML_TEMPLATE.format(logout_html=logout_html, avatar_txt=avatar_txt, logo_html=logo_html, auth_qs=auth_qs)
 
     # Streamlit recente espone st.html() (render HTML in-page). Se non disponibile, fallback a markdown.
     try:
@@ -3526,7 +3630,7 @@ def _render_ai_products_from_portfolio(client_key: str, pid: str, payload: dict)
 
     if not (isinstance(db, dict) and isinstance(db.get("df"), pd.DataFrame)):
         st.warning("Database Prodotti non disponibile. Carichi prima il file in Tools → Database Prodotti.")
-        st.markdown('👉 <a href="?main=Tools&tools=Database%20Prodotti" target="_self">Apri Tools → Database Prodotti</a>', unsafe_allow_html=True)
+        st.markdown('👉 <a href="?{auth_qs}main=Tools&tools=Database%20Prodotti" target="_self">Apri Tools → Database Prodotti</a>', unsafe_allow_html=True)
         return
 
     products_df = db["df"].copy()
