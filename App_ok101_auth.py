@@ -93,6 +93,10 @@ def _get_app_mode() -> str:
 
 APP_MODE = _get_app_mode()
 
+# --- Auth mode (Streamlit Cloud Secrets / env) ---
+AUTH_MODE = str(os.getenv('UW_AUTH_MODE', 'local')).strip().lower() or 'local'
+
+
 def _get_auth_provider() -> str | None:
     try:
         p = st.secrets.get("app", {}).get("auth_provider", None)
@@ -147,7 +151,7 @@ def _get_storage_config() -> dict:
 def _resolve_user_id() -> str:
     """Ritorna l'identificativo utente. In AUTH_MODE='local' usa username; altrimenti usa st.user (OIDC)."""
     # --- Local auth (username/password) ---
-    if APP_MODE == "prod" and str(AUTH_MODE).lower() == "local":
+    if APP_MODE == "prod" and str(globals().get('AUTH_MODE','local')).lower() == "local":
         u = st.session_state.get("auth_user", None)
         ok = bool(st.session_state.get("auth_logged_in", False))
         if ok and u:
@@ -351,7 +355,7 @@ def _handle_app_actions() -> None:
     # Logout richiesto dalla navbar (solo in PROD)
     action = _get_query_param_value("action")
     # Logout in modalità LOCAL
-    if APP_MODE == "prod" and str(AUTH_MODE).lower() == "local" and action == "logout":
+    if APP_MODE == "prod" and str(globals().get('AUTH_MODE','local')).lower() == "local" and action == "logout":
         st.session_state["auth_logged_in"] = False
         st.session_state["auth_user"] = None
         st.session_state.pop("auth_name", None)
