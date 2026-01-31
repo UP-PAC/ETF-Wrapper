@@ -80,21 +80,25 @@ from storage import UserStorage
 # =======================
 
 def _get_app_mode() -> str:
+    """Ritorna 'prod' o 'dev'. Su Streamlit Cloud legge dai Secrets (APP_MODE) oppure da env."""
     try:
-        # preferenza: secrets -> env -> default
         mode = None
         if hasattr(st, "secrets"):
-            mode = st.secrets.get("app", {}).get("mode", None)
+            # supporta sia: APP_MODE="prod" (top-level) sia: [app] mode="prod"
+            mode = st.secrets.get("APP_MODE", None)
+            if not mode:
+                mode = st.secrets.get("app", {}).get("mode", None)
         if not mode:
             mode = os.getenv("APP_MODE", "dev")
-        return str(mode).strip().lower()
+        s = str(mode).strip().lower()
+        return s if s else "dev"
     except Exception:
         return "dev"
 
 APP_MODE = _get_app_mode()
 
 # --- Auth mode (Streamlit Cloud Secrets / env) ---
-AUTH_MODE = str(os.getenv('UW_AUTH_MODE', 'local')).strip().lower() or 'local'
+AUTH_MODE = str((st.secrets.get('UW_AUTH_MODE') if hasattr(st,'secrets') else None) or os.getenv('UW_AUTH_MODE','local')).strip().lower() or 'local'
 
 
 def _get_auth_provider() -> str | None:
