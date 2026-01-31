@@ -143,62 +143,59 @@ def _get_storage_config() -> dict:
     return {"backend": str(backend).strip().lower(), "dsn": dsn, "bucket": bucket, "prefix": prefix}
 
 
+
 def _resolve_user_id() -> str:
-    """Ritorna un identificativo utente stabile.
-    In DEV: user_id='dev'
-    In PROD:
-      - auth_mode='oidc'  -> Streamlit login (st.login)
-      - auth_mode='local' -> registrazione + user/password gestiti dall'app (demo)
-    """
+    """Ritorna l'identificativo utente. In AUTH_MODE='local' usa username; altrimenti usa st.user (OIDC)."""
+    # --- Local auth (username/password) ---
+    if APP_MODE == "prod" and str(AUTH_MODE).lower() == "local":
+        u = st.session_state.get("auth_user", None)
+        ok = bool(st.session_state.get("auth_logged_in", False))
+        if ok and u:
+            return str(u)
+        # non loggato: verrà gestito dal gate di autenticazione più sotto
+        return "anonymous"
+
+    # --- DEV mode (no auth) ---
     if APP_MODE != "prod":
         return "dev"
 
-    auth_mode = _get_auth_mode()
+    # --- Streamlit OIDC login ---
+    provider = _get_auth_provider()
 
-    # -----------------------
-    # (1) AUTH OIDC (Streamlit)
-    # -----------------------
-    if auth_mode == "oidc":
-        provider = _get_auth_provider()
+    try:
+        is_logged = bool(getattr(st.user, "is_logged_in", False))
+    except Exception:
+        is_logged = False
 
-        try:
-            is_logged = bool(getattr(st.user, "is_logged_in", False))
-        except Exception:
-            is_logged = False
-
-        if not is_logged:
-            st.markdown(
-                "<div class='uw-card'><h2>Accesso</h2>"
-                "<p>Per utilizzare l’app è necessario effettuare il login.</p></div>",
-                unsafe_allow_html=True,
-            )
-            if st.button("Log in", use_container_width=True):
-                if provider is None:
-                    st.login()
-                else:
-                    st.login(provider)
-            st.stop()
-
-        try:
-            email = None
-            if hasattr(st.user, "get"):
-                email = st.user.get("email", None)
-                sub = st.user.get("sub", None)
+    if not is_logged:
+        st.markdown("<div class='uw-card'><h2>Accesso</h2><p>Per utilizzare l’app è necessario effettuare il login.</p></div>", unsafe_allow_html=True)
+        if st.button("Log in", use_container_width=True):
+            if provider is None:
+                st.login()
             else:
-                sub = None
-            if not email:
-                email = getattr(st.user, "email", None)
-            if email:
-                return str(email)
-            if sub:
-                return str(sub)
-            name = getattr(st.user, "name", None)
-            if name:
-                return str(name)
-        except Exception:
-            pass
+                st.login(provider)
+        st.stop()
 
-        return "unknown_user"
+    try:
+        email = None
+        if hasattr(st.user, "get"):
+            email = st.user.get("email", None)
+            sub = st.user.get("sub", None)
+        else:
+            sub = None
+        if not email:
+            email = getattr(st.user, "email", None)
+        if email:
+            return str(email)
+        if sub:
+            return str(sub)
+        name = getattr(st.user, "name", None)
+        if name:
+            return str(name)
+    except Exception:
+        pass
+
+    return "unknown_user"
 
     # -----------------------
     # (2) AUTH LOCALE (demo)
@@ -353,6 +350,15 @@ def _get_query_param_value(key: str) -> str | None:
 def _handle_app_actions() -> None:
     # Logout richiesto dalla navbar (solo in PROD)
     action = _get_query_param_value("action")
+    # Logout in modalità LOCAL
+    if APP_MODE == "prod" and str(AUTH_MODE).lower() == "local" and action == "logout":
+        st.session_state["auth_logged_in"] = False
+        st.session_state["auth_user"] = None
+        st.session_state.pop("auth_name", None)
+        st.session_state.pop("auth_surname", None)
+        st.session_state.pop("auth_address", None)
+        st.experimental_set_query_params()  # pulisce i parametri
+        st.rerun()
     if APP_MODE == "prod" and action == "logout":
         # st.logout() avvia una nuova sessione e torna alla home
         try:
@@ -1151,7 +1157,7 @@ def build_grid_highlight_html(df: pd.DataFrame, highlight_row: str | None, highl
             except Exception:
                 vx = 0.0
             is_hl = (highlight_row == r) and (highlight_col == c)
-            style = " style=\"background: rgba(14,165,233,0.18); border: 1px solid rgba(14,165,233,0.55);\"" if is_hl else ""
+            style = " style="background: rgba(14,165,233,0.18); border: 1px solid rgba(14,165,233,0.55);"" if is_hl else ""
             html.append(f"<td{style}>{vx:.0f}%</td>")
         html.append("</tr>")
 
@@ -1703,7 +1709,7 @@ def render_database_prodotti():
 
     st.markdown(
         '<div class="uw-card"><h2>Database Prodotti</h2>'
-        '<p>Carichi un file Excel con l\'universo ETF/fondi e le metriche di valutazione (TER, AUM, rischio, performance, ESG, ecc.). '
+        '<p>Carichi un file Excel con l'universo ETF/fondi e le metriche di valutazione (TER, AUM, rischio, performance, ESG, ecc.). '
         'Il foglio consigliato è <b>ETF</b>; in alternativa verrà letto il primo foglio.</p>'
         '<ul>'
         '<li><b>Colonne obbligatorie</b>: isin, name, provider, asset_class, ter, aum_eur, currency, hedged, accumulating, replication, ucits</li>'
