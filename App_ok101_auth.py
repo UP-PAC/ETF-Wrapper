@@ -98,7 +98,14 @@ def _get_app_mode() -> str:
 APP_MODE = _get_app_mode()
 
 # --- Auth mode (Streamlit Cloud Secrets / env) ---
-AUTH_MODE = str((st.secrets.get('UW_AUTH_MODE') if hasattr(st,'secrets') else None) or os.getenv('UW_AUTH_MODE','local')).strip().lower() or 'local'
+# --- AUTH MODE: secrets.toml (se presente) -> env var -> fallback 'local'
+try:
+    AUTH_MODE = str(st.secrets["UW_AUTH_MODE"]).strip().lower()
+except Exception:
+    AUTH_MODE = os.getenv("UW_AUTH_MODE", "local").strip().lower()
+
+if not AUTH_MODE:
+    AUTH_MODE = "local"
 
 
 def _get_auth_provider() -> str | None:
@@ -152,14 +159,8 @@ def _get_storage_config() -> dict:
 
 
 
-
 def _render_local_auth_page() -> None:
-    """Pagina unica di accesso/registrazione per AUTH_MODE='local'.
-
-    Usa esclusivamente:
-      - st.session_state["auth_logged_in"] (bool)
-      - st.session_state["auth_user"] (str | None)
-    """
+    """Pagina unica di accesso/registrazione per AUTH_MODE='local'."""
     import re as _re
     import pickle as _pickle
     import secrets as _secrets
@@ -283,7 +284,6 @@ def _render_local_auth_page() -> None:
                 _save_users(db)
                 st.success("Registrazione completata. Ora può accedere dalla tab 'Accedi'.")
 
-
 def _resolve_user_id() -> str:
     """
     Ritorna l'identificativo utente.
@@ -345,20 +345,6 @@ def _resolve_user_id() -> str:
         pass
 
     return "unknown_user"
-
-
-# --- Logout (modalità local) ---
-def _sidebar_logout_local() -> None:
-    if str(APP_MODE).lower() == "prod" and str(globals().get("AUTH_MODE","local")).lower() == "local":
-        if st.session_state.get("auth_logged_in") and st.session_state.get("auth_user"):
-            with st.sidebar:
-                st.markdown("### Sessione")
-                st.caption(f"Utente: {st.session_state.get('auth_user')}")
-                if st.button("Logout", use_container_width=True):
-                    st.session_state["auth_logged_in"] = False
-                    st.session_state["auth_user"] = None
-                    st.rerun()
-
 
     # -----------------------
     # (2) AUTH LOCALE (demo)
@@ -491,7 +477,6 @@ def _sidebar_logout_local() -> None:
 # Storage per-utente (filesystem, backend provvisorio)
 from pathlib import Path
 _USER_ID = _resolve_user_id()
-_sidebar_logout_local()
 
 # =======================
 # Action handler (query params) – es. logout
