@@ -5060,14 +5060,39 @@ def render_crea_portafoglio():
             labels.append(f"Y{year}-P{within}")
             amounts.append(float(periodic_amount) if p <= periodic_periods else 0.0)
 
-    contrib_df = pd.DataFrame({"Periodo": labels, "Conferimenti (€)": amounts})
-    fig_contrib = px.bar(contrib_df, x="Periodo", y="Conferimenti (€)")
-    fig_contrib.update_traces(marker_color="rgba(120, 200, 120, 0.8)")
+    # --- Grafico conferimenti: barre blu (iniziale+periodiche) + cumulato (verdino chiaro quasi trasparente)
+    cum_amounts = list(np.cumsum(np.array(amounts, dtype=float)))
+
+    fig_contrib = go.Figure()
+
+    # Cumulato (sfondo): verdino chiaro, quasi trasparente
+    fig_contrib.add_trace(go.Bar(
+    x=labels,
+    y=cum_amounts,
+    name="Conferimenti cumulati",
+    marker=dict(color="rgba(120, 200, 120, 0.22)", line=dict(width=0)),
+    width=0.90,
+    hovertemplate="Periodo: %{x}<br>Cumulato: %{y:,.0f} €<extra></extra>",
+    ))
+
+    # Conferimenti per periodo: blu (iniziale e versamenti periodici)
+    fig_contrib.add_trace(go.Bar(
+    x=labels,
+    y=amounts,
+    name="Conferimenti",
+    marker=dict(color="rgba(40, 120, 220, 0.85)", line=dict(width=0)),
+    width=0.55,
+    hovertemplate="Periodo: %{x}<br>Conferimento: %{y:,.0f} €<extra></extra>",
+    ))
+
     fig_contrib.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_title="",
-        yaxis_title="€"
+    barmode="overlay",
+    margin=dict(l=10, r=10, t=30, b=10),
+    xaxis_title="",
+    yaxis_title="€",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+
     st.plotly_chart(fig_contrib, use_container_width=True)
 
     # -----------------------
@@ -6226,12 +6251,45 @@ def render_crea_soluzione_gbi():
             amounts.append(float(periodic_amount) if p <= periodic_periods else 0.0)
 
     contrib_df = pd.DataFrame({"Periodo": labels_p, "Conferimenti (€)": amounts})
-    fig_contrib = px.bar(contrib_df, x="Periodo", y="Conferimenti (€)")
+
+    # Barre cumulate (iniziale + versamenti periodici)
+    contrib_df["Cumulato (€)"] = contrib_df["Conferimenti (€)"].cumsum()
+
+    # Grafico: cumulato (verdino chiaro, quasi trasparente) come sfondo + conferimenti come barre principali
+    x_vals = contrib_df["Periodo"].astype(str).tolist()
+    y_contrib = contrib_df["Conferimenti (€)"].astype(float).tolist()
+    y_cum = contrib_df["Cumulato (€)"].astype(float).tolist()
+
+    fig_contrib = go.Figure()
+
+    # Cumulato: verdino chiaro, quasi trasparente, barra più larga per essere visibile anche con overlay
+    fig_contrib.add_trace(go.Bar(
+        x=x_vals,
+        y=y_cum,
+        name="Cumulato conferimenti",
+        marker=dict(color="rgba(144, 238, 144, 0.22)", line=dict(width=0)),
+        width=0.88,
+        hovertemplate="%{x}<br>Cumulato: %{y:,.0f} €<extra></extra>",
+    ))
+
+    # Conferimenti: barre principali (iniziale e periodici) più strette, sopra al cumulato
+    fig_contrib.add_trace(go.Bar(
+        x=x_vals,
+        y=y_contrib,
+        name="Conferimenti",
+        marker=dict(color="rgba(31, 119, 180, 0.95)", line=dict(width=0)),
+        width=0.56,
+        hovertemplate="%{x}<br>Conferimento: %{y:,.0f} €<extra></extra>",
+    ))
+
     fig_contrib.update_layout(
+        barmode="overlay",
         margin=dict(l=10, r=10, t=30, b=10),
         xaxis_title="",
-        yaxis_title="€"
+        yaxis_title="€",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
     )
+
     st.plotly_chart(fig_contrib, use_container_width=True)
 
     # -----------------------
@@ -7753,6 +7811,47 @@ def render_crea_soluzione_gbi():
                         
                             xs_g, ys_g = _concat_paths_idx(show_idx)
                             fig_dyn = go.Figure()
+
+                            # ------------------------------------------------------------
+                            # Barre verdine (quasi trasparenti): cumulato conferimenti
+                            # (iniziale + versamenti periodici) come "sfondo" del grafico
+                            # ------------------------------------------------------------
+                            try:
+                                _mult = {"Mensile": 12, "Trimestrale": 4, "Semestrale": 2, "Annuale": 1}.get(freq, 1)
+                                _hY = int(horizon_years)
+                                _pY = int(periodic_years)
+
+                                if freq == "Annuale":
+                                    _t_years = [0.0] + [float(y) for y in range(1, _hY + 1)]
+                                    _flows = [float(initial_amount)] + [
+                                        float(periodic_amount) if y <= _pY else 0.0
+                                        for y in range(1, _hY + 1)
+                                    ]
+                                else:
+                                    _total_p = _hY * _mult
+                                    _periodic_p = _pY * _mult
+                                    _t_years = [0.0]
+                                    _flows = [float(initial_amount)]
+                                    for p in range(1, _total_p + 1):
+                                        _t_years.append(p / float(_mult))
+                                        _flows.append(float(periodic_amount) if p <= _periodic_p else 0.0)
+
+                                _cum = np.cumsum(np.array(_flows, dtype=float)).tolist()
+                                _bar_w = 0.60 / float(_mult)  # larghezza (in anni)
+                            except Exception:
+                                _t_years, _cum, _bar_w = [], [], None
+
+                            if _t_years and _cum:
+                                fig_dyn.add_trace(go.Bar(
+                                    x=_t_years,
+                                    y=_cum,
+                                    name="Cumulato conferimenti",
+                                    yaxis="y2",
+                                    marker=dict(color="rgba(144, 238, 144, 0.22)", line=dict(width=0)),
+                                    width=_bar_w,
+                                    hovertemplate="t=%{x:.2f} anni<br>Cumulato conferimenti: %{y:,.0f} €<extra></extra>",
+                                ))
+
                             fig_dyn.add_trace(go.Scatter(
                                 x=xs_g, y=ys_g,
                                 mode="lines",
@@ -7789,6 +7888,7 @@ def render_crea_soluzione_gbi():
                                 yaxis_title="Montante (€)",
                                 margin=dict(l=10, r=10, t=60, b=10),
                                 yaxis=dict(range=[y_min - pad, y_max + pad], automargin=True, showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False),
+                                yaxis2=dict(overlaying="y", matches="y", visible=False, showgrid=False, zeroline=False),
                                 xaxis=dict(automargin=True, showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False),
                                 hovermode="x unified",
                                 plot_bgcolor="white",
