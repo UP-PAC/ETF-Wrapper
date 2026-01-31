@@ -594,6 +594,39 @@ def _get_query_param_value(key: str) -> str | None:
     return s if s else None
 
 def _handle_app_actions() -> None:
+    """Gestisce azioni via query params (es. logout)."""
+    action = _get_query_param_value("action")
+    if not action:
+        return
+
+    if str(action).strip().lower() == "logout":
+        # Reset sessione auth (locale o OIDC) + pulizia query params
+        try:
+            for k in ("auth_logged_in", "auth_user", "auth_token"):
+                if k in st.session_state:
+                    st.session_state.pop(k, None)
+        except Exception:
+            pass
+
+        # Pulizia query params (compatibile vecchie API)
+        try:
+            # Nuova API (st.query_params)
+            st.query_params.clear()
+        except Exception:
+            try:
+                st.experimental_set_query_params()
+            except Exception:
+                pass
+
+        # Se presente, esegue logout OIDC (non necessario in locale, ma innocuo se non supportato)
+        try:
+            if hasattr(st, "logout"):
+                st.logout()
+        except Exception:
+            pass
+
+        st.rerun()
+
 
 def _render_floating_logout_button() -> None:
     """Pulsante logout non invasivo (in alto a destra) visibile solo dentro l'app."""
@@ -626,41 +659,9 @@ def _render_floating_logout_button() -> None:
     # Link-azione: viene gestito da _handle_app_actions all'inizio del run successivo
     st.markdown('<div class="uw-logout"><a href="?action=logout">Logout</a></div>', unsafe_allow_html=True)
 
-_render_floating_logout_button()
-
-    """Gestisce azioni via query params (es. logout)."""
-    action = _get_query_param_value("action")
-    if not action:
-        return
-    if str(action).strip().lower() == "logout":
-        # Reset sessione auth (locale o OIDC) + pulizia query params
-        try:
-            for k in ("auth_logged_in", "auth_user", "auth_token"):
-                if k in st.session_state:
-                    st.session_state.pop(k, None)
-        except Exception:
-            pass
-
-        # Pulizia query params (compatibile vecchie API)
-        try:
-            # Nuova API (st.query_params)
-            st.query_params.clear()
-        except Exception:
-            try:
-                st.experimental_set_query_params()
-            except Exception:
-                pass
-
-        # Se presente, esegue logout OIDC (non necessario in locale, ma innocuo se non supportato)
-        try:
-            if hasattr(st, "logout"):
-                st.logout()
-        except Exception:
-            pass
-
-        st.rerun()
 
 _handle_app_actions()
+_render_floating_logout_button()
 
 if "_user_storage" not in st.session_state:
     cfg = _get_storage_config()
