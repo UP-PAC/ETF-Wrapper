@@ -152,142 +152,153 @@ def _get_storage_config() -> dict:
 
 
 
-def _resolve_user_id() -> str:
-    """Ritorna l'identificativo utente.
+def _render_local_auth_page() -> None:
+    """Pagina unica di accesso/registrazione per AUTH_MODE='local'."""
+    import re as _re
+    import pickle as _pickle
+    import secrets as _secrets
+    import hashlib as _hashlib
 
-    - In PROD + AUTH_MODE='local': mostra una pagina 'Accedi/Registrati' finché l'utente non è loggato.
-    - In DEV: user_id='dev'
-    - In PROD + AUTH_MODE!='local': usa Streamlit OIDC (st.login / st.user).
+    # inizializza chiavi sessione (senza sovrascrivere)
+    st.session_state.setdefault("auth_logged_in", False)
+    st.session_state.setdefault("auth_user", None)
+
+    def _slug(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = _re.sub(r"[^a-z0-9_\-\.]+", "_", s)
+        return s[:64] if s else ""
+
+    AUTH_DIR = Path(__file__).resolve().parent / "auth_storage"
+    AUTH_DIR.mkdir(exist_ok=True)
+    AUTH_DB = AUTH_DIR / "users.pkl"
+
+    def _load_users() -> dict:
+        try:
+            if AUTH_DB.exists():
+                with open(AUTH_DB, "rb") as f:
+                    obj = _pickle.load(f)
+                    return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_users(db: dict) -> None:
+        try:
+            with open(AUTH_DB, "wb") as f:
+                _pickle.dump(db, f)
+        except Exception:
+            st.error("Impossibile salvare l’utenza (storage non scrivibile).")
+            st.stop()
+
+    def _hash_pwd(pwd: str, salt_b64: str | None = None) -> tuple[str, str]:
+        pwd_b = (pwd or "").encode("utf-8")
+        if not salt_b64:
+            salt = _secrets.token_bytes(16)
+            salt_b64 = base64.b64encode(salt).decode("ascii")
+        else:
+            salt = base64.b64decode(salt_b64.encode("ascii"))
+        dk = _hashlib.pbkdf2_hmac("sha256", pwd_b, salt, 200_000)
+        return base64.b64encode(dk).decode("ascii"), salt_b64
+
+    def _verify_pwd(pwd: str, stored_hash_b64: str, salt_b64: str) -> bool:
+        cand_hash, _ = _hash_pwd(pwd, salt_b64=salt_b64)
+        try:
+            return hmac.compare_digest(cand_hash, stored_hash_b64)
+        except Exception:
+            return cand_hash == stored_hash_b64
+
+    db = _load_users()
+
+    st.markdown(
+        "<div class='uw-card'><h2>Accesso</h2>"
+        "<p>Per utilizzare l’app è necessario registrarsi e poi accedere con User e Password.</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    tabs = st.tabs(["Accedi", "Registrati"])
+
+    with tabs[0]:
+        user = st.text_input("User", key="_login_user")
+        pwd = st.text_input("Password", type="password", key="_login_pwd")
+        if st.button("Accedi", use_container_width=True, key="_btn_login"):
+            u = _slug(user)
+            rec = db.get(u)
+            if not u or rec is None:
+                st.error("User non valida o non registrata.")
+            else:
+                if _verify_pwd(pwd, rec.get("pwd_hash", ""), rec.get("pwd_salt", "")):
+                    st.session_state["auth_logged_in"] = True
+                    st.session_state["auth_user"] = u
+                    st.success("Accesso effettuato.")
+                    st.rerun()
+                else:
+                    st.error("Password errata.")
+
+    with tabs[1]:
+        st.markdown("<div class='uw-card'><h3>Registrati</h3></div>", unsafe_allow_html=True)
+        with st.form(key="_form_register", clear_on_submit=False):
+            st.text_input("Nome", key="_reg_nome")
+            st.text_input("Cognome", key="_reg_cognome")
+            st.text_input("Indirizzo", key="_reg_indirizzo")
+            st.text_input("User (scegli un identificativo)", key="_reg_user")
+            st.text_input("Password", type="password", key="_reg_pwd1")
+            st.text_input("Conferma Password", type="password", key="_reg_pwd2")
+            submitted = st.form_submit_button("Crea account", use_container_width=True)
+
+        if submitted:
+            nome = str(st.session_state.get("_reg_nome", "")).strip()
+            cognome = str(st.session_state.get("_reg_cognome", "")).strip()
+            indirizzo = str(st.session_state.get("_reg_indirizzo", "")).strip()
+            new_user = str(st.session_state.get("_reg_user", ""))
+            pwd1 = str(st.session_state.get("_reg_pwd1", ""))
+            pwd2 = str(st.session_state.get("_reg_pwd2", ""))
+
+            u = _slug(new_user)
+            if not nome or not cognome or not indirizzo:
+                st.error("Compilare Nome, Cognome e Indirizzo.")
+            elif not u or len(u) < 3:
+                st.error("La User deve avere almeno 3 caratteri (lettere/numeri).")
+            elif u in db:
+                st.error("Questa User è già registrata.")
+            elif not pwd1 or len(pwd1) < 8:
+                st.error("La Password deve avere almeno 8 caratteri.")
+            elif pwd1 != pwd2:
+                st.error("Le due password non coincidono.")
+            else:
+                h, s = _hash_pwd(pwd1)
+                db[u] = {
+                    "nome": nome,
+                    "cognome": cognome,
+                    "indirizzo": indirizzo,
+                    "pwd_hash": h,
+                    "pwd_salt": s,
+                }
+                _save_users(db)
+                st.success("Registrazione completata. Ora può accedere dalla tab 'Accedi'.")
+
+def _resolve_user_id() -> str:
     """
-    # --- DEV mode (no auth) ---
+    Ritorna l'identificativo utente.
+
+    - DEV: user_id="dev"
+    - PROD + AUTH_MODE="local": richiede login/registrazione una sola volta per sessione browser.
+    - PROD + AUTH_MODE!="local": usa Streamlit OIDC (st.login / st.user).
+    """
+    # --- DEV mode ---
     if str(APP_MODE).lower() != "prod":
         return "dev"
 
+    mode = str(globals().get("AUTH_MODE", "local")).strip().lower() or "local"
+
     # --- Local auth (username/password) ---
-    if str(globals().get("AUTH_MODE", "local")).lower() == "local":
-        import re as _re
-        import pickle as _pickle
-        import secrets as _secrets
-        import hashlib as _hashlib
-
-        def _slug(s: str) -> str:
-            s = (s or "").strip().lower()
-            s = _re.sub(r"[^a-z0-9_\-\.]+", "_", s)
-            return s[:64] if s else ""
-
-        AUTH_DIR = Path(__file__).resolve().parent / "auth_storage"
-        AUTH_DIR.mkdir(exist_ok=True)
-        AUTH_DB = AUTH_DIR / "users.pkl"
-
-        def _load_users() -> dict:
-            try:
-                if AUTH_DB.exists():
-                    with open(AUTH_DB, "rb") as f:
-                        obj = _pickle.load(f)
-                        return obj if isinstance(obj, dict) else {}
-            except Exception:
-                pass
-            return {}
-
-        def _save_users(db: dict) -> None:
-            try:
-                with open(AUTH_DB, "wb") as f:
-                    _pickle.dump(db, f)
-            except Exception:
-                st.error("Impossibile salvare l’utenza (storage non scrivibile).")
-                st.stop()
-
-        def _hash_pwd(pwd: str, salt_b64: str | None = None) -> tuple[str, str]:
-            pwd_b = (pwd or "").encode("utf-8")
-            if not salt_b64:
-                salt = _secrets.token_bytes(16)
-                salt_b64 = base64.b64encode(salt).decode("ascii")
-            else:
-                salt = base64.b64decode(salt_b64.encode("ascii"))
-            dk = _hashlib.pbkdf2_hmac("sha256", pwd_b, salt, 200_000)
-            return base64.b64encode(dk).decode("ascii"), salt_b64
-
-        def _verify_pwd(pwd: str, stored_hash_b64: str, salt_b64: str) -> bool:
-            cand_hash, _ = _hash_pwd(pwd, salt_b64=salt_b64)
-            try:
-                return hmac.compare_digest(cand_hash, stored_hash_b64)
-            except Exception:
-                return cand_hash == stored_hash_b64
-
+    if mode == "local":
         # Se già loggato, ritorna subito l'utente
-        if st.session_state.get("_auth_local_ok") and st.session_state.get("_auth_user"):
-            return str(st.session_state.get("_auth_user"))
+        if st.session_state.get("auth_logged_in") and st.session_state.get("auth_user"):
+            return str(st.session_state.get("auth_user"))
 
-        db = _load_users()
-
-        st.markdown(
-            "<div class='uw-card'><h2>Accesso</h2>"
-            "<p>Per utilizzare l’app è necessario registrarsi e poi accedere con User e Password.</p>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-        tabs = st.tabs(["Accedi", "Registrati"])
-
-        with tabs[0]:
-            user = st.text_input("User", key="_login_user")
-            pwd = st.text_input("Password", type="password", key="_login_pwd")
-            if st.button("Accedi", use_container_width=True, key="_btn_login"):
-                u = _slug(user)
-                rec = db.get(u)
-                if not u or rec is None:
-                    st.error("User non valida o non registrata.")
-                else:
-                    if _verify_pwd(pwd, rec.get("pwd_hash", ""), rec.get("pwd_salt", "")):
-                        st.session_state["_auth_local_ok"] = True
-                        st.session_state["_auth_user"] = u
-                        st.success("Accesso effettuato.")
-                        st.rerun()
-                    else:
-                        st.error("Password errata.")
-
-        with tabs[1]:
-            st.markdown("<div class='uw-card'><h3>Registrati</h3></div>", unsafe_allow_html=True)
-            with st.form(key="_form_register", clear_on_submit=False):
-                st.text_input("Nome", key="_reg_nome")
-                st.text_input("Cognome", key="_reg_cognome")
-                st.text_input("Indirizzo", key="_reg_indirizzo")
-                st.text_input("User (scegli un identificativo)", key="_reg_user")
-                st.text_input("Password", type="password", key="_reg_pwd1")
-                st.text_input("Conferma Password", type="password", key="_reg_pwd2")
-                submitted = st.form_submit_button("Crea account", use_container_width=True)
-
-            if submitted:
-                nome = str(st.session_state.get("_reg_nome", "")).strip()
-                cognome = str(st.session_state.get("_reg_cognome", "")).strip()
-                indirizzo = str(st.session_state.get("_reg_indirizzo", "")).strip()
-                new_user = str(st.session_state.get("_reg_user", ""))
-                pwd1 = str(st.session_state.get("_reg_pwd1", ""))
-                pwd2 = str(st.session_state.get("_reg_pwd2", ""))
-
-                u = _slug(new_user)
-                if not nome or not cognome or not indirizzo:
-                    st.error("Compilare Nome, Cognome e Indirizzo.")
-                elif not u or len(u) < 3:
-                    st.error("La User deve avere almeno 3 caratteri (lettere/numeri).")
-                elif u in db:
-                    st.error("Questa User è già registrata.")
-                elif not pwd1 or len(pwd1) < 8:
-                    st.error("La Password deve avere almeno 8 caratteri.")
-                elif pwd1 != pwd2:
-                    st.error("Le due password non coincidono.")
-                else:
-                    h, s = _hash_pwd(pwd1)
-                    db[u] = {
-                        "nome": nome,
-                        "cognome": cognome,
-                        "indirizzo": indirizzo,
-                        "pwd_hash": h,
-                        "pwd_salt": s,
-                    }
-                    _save_users(db)
-                    st.success("Registrazione completata. Ora può accedere dalla tab 'Accedi'.")
-
+        # Altrimenti mostra la pagina di accesso/registrazione e ferma l'app
+        _render_local_auth_page()
         st.stop()
 
     # --- Streamlit OIDC login (fallback) ---
