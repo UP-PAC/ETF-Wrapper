@@ -283,18 +283,29 @@ def _resolve_user_id() -> str:
                 else:
                     st.error("Password errata.")
 
-    with tabs[1]:
+        with tabs[1]:
         st.markdown("<div class='uw-card'><h3>Registrati</h3></div>", unsafe_allow_html=True)
-        nome = st.text_input("Nome", key="_reg_nome")
-        cognome = st.text_input("Cognome", key="_reg_cognome")
-        indirizzo = st.text_input("Indirizzo", key="_reg_indirizzo")
-        new_user = st.text_input("User (scegli un identificativo)", key="_reg_user")
-        pwd1 = st.text_input("Password", type="password", key="_reg_pwd1")
-        pwd2 = st.text_input("Conferma Password", type="password", key="_reg_pwd2")
 
-        if st.button("Crea account", use_container_width=True, key="_btn_register"):
+        # Uso di un form per evitare che, al click, Streamlit perda/alteri i valori dei campi
+        with st.form(key="_form_register", clear_on_submit=False):
+            st.text_input("Nome", key="_reg_nome")
+            st.text_input("Cognome", key="_reg_cognome")
+            st.text_input("Indirizzo", key="_reg_indirizzo")
+            st.text_input("User (scegli un identificativo)", key="_reg_user")
+            st.text_input("Password", type="password", key="_reg_pwd1")
+            st.text_input("Conferma Password", type="password", key="_reg_pwd2")
+            submitted = st.form_submit_button("Crea account", use_container_width=True)
+
+        if submitted:
+            nome = str(st.session_state.get("_reg_nome", "")).strip()
+            cognome = str(st.session_state.get("_reg_cognome", "")).strip()
+            indirizzo = str(st.session_state.get("_reg_indirizzo", "")).strip()
+            new_user = str(st.session_state.get("_reg_user", ""))
+            pwd1 = str(st.session_state.get("_reg_pwd1", ""))
+            pwd2 = str(st.session_state.get("_reg_pwd2", ""))
+
             u = _slug(new_user)
-            if not nome.strip() or not cognome.strip() or not indirizzo.strip():
+            if any(len(x) == 0 for x in (nome, cognome, indirizzo)):
                 st.error("Compilare Nome, Cognome e Indirizzo.")
             elif not u or len(u) < 3:
                 st.error("La User deve avere almeno 3 caratteri (lettere/numeri).")
@@ -307,9 +318,9 @@ def _resolve_user_id() -> str:
             else:
                 h, s = _hash_pwd(pwd1)
                 db[u] = {
-                    "nome": nome.strip(),
-                    "cognome": cognome.strip(),
-                    "indirizzo": indirizzo.strip(),
+                    "nome": nome,
+                    "cognome": cognome,
+                    "indirizzo": indirizzo,
                     "pwd_hash": h,
                     "pwd_salt": s,
                 }
