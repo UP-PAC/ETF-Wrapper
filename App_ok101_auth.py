@@ -1709,7 +1709,7 @@ def render_database_prodotti():
 
     st.markdown(
         '<div class="uw-card"><h2>Database Prodotti</h2>'
-        '<p>Carichi un file Excel con l'universo ETF/fondi e le metriche di valutazione (TER, AUM, rischio, performance, ESG, ecc.). '
+        '<p>Carichi un file Excel con l\'universo ETF/fondi e le metriche di valutazione (TER, AUM, rischio, performance, ESG, ecc.). '
         'Il foglio consigliato è <b>ETF</b>; in alternativa verrà letto il primo foglio.</p>'
         '<ul>'
         '<li><b>Colonne obbligatorie</b>: isin, name, provider, asset_class, ter, aum_eur, currency, hedged, accumulating, replication, ucits</li>'
