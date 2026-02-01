@@ -97,19 +97,101 @@ def _get_app_mode() -> str:
 
 APP_MODE = _get_app_mode()
 
-def _safe_secrets_get(key: str, default=None):
-    """Legge una chiave da st.secrets senza sollevare StreamlitSecretNotFoundError se secrets.toml non esiste."""
-    try:
-        if hasattr(st, "secrets"):
-            return st.secrets.get(key, default)
-    except Exception:
-        return default
-    return default
-
 # --- Auth mode (Streamlit Cloud Secrets / env) ---
-AUTH_MODE = str(_safe_secrets_get("UW_AUTH_MODE", None) or os.getenv("UW_AUTH_MODE", "local")).strip().lower() or "local"
+# --- AUTH MODE: secrets.toml (se presente) -> env var -> fallback 'local'
+try:
+    AUTH_MODE = str(st.secrets["UW_AUTH_MODE"]).strip().lower()
+except Exception:
+    AUTH_MODE = os.getenv("UW_AUTH_MODE", "local").strip().lower()
+
+if not AUTH_MODE:
+    AUTH_MODE = "local"
 
 
+
+# =======================
+# Local auth persistence (signed token in query params)
+# Obiettivo: evitare nuove richieste di login quando la navigazione usa link (?main=...)
+# =======================
+import hashlib as _hashlib
+import time as _time
+import base64 as _base64
+import urllib.parse as _urlparse
+
+def _get_local_auth_secret() -> bytes:
+    """Segreto per firmare i token di persistenza (env/secrets)."""
+    try:
+        s = None
+        if hasattr(st, "secrets"):
+            s = st.secrets.get("UW_AUTH_SECRET", None)
+        if not s:
+            s = os.getenv("UW_AUTH_SECRET", None)
+        if not s:
+            # fallback: non ideale ma evita crash in demo locale
+            s = "uw-local-dev-secret"
+        return str(s).encode("utf-8")
+    except Exception:
+        return b"uw-local-dev-secret"
+
+def _make_local_auth_token(user: str, ttl_days: int = 7) -> str:
+    """Crea un token firmato (base64url) valido per ttl_days."""
+    user = (user or "").strip()
+    ts = int(_time.time())
+    payload = f"{user}|{ts}"
+    sig = hmac.new(_get_local_auth_secret(), payload.encode("utf-8"), digestmod=_hashlib.sha256).hexdigest()
+    raw = f"{payload}|{sig}".encode("utf-8")
+    return _base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+def _validate_local_auth_token(user: str, token: str, ttl_days: int = 7) -> bool:
+    """Valida token firmato e scadenza."""
+    try:
+        if not user or not token:
+            return False
+        pad = "=" * (-len(token) % 4)
+        raw = _base64.urlsafe_b64decode((token + pad).encode("utf-8")).decode("utf-8")
+        parts = raw.split("|")
+        if len(parts) != 3:
+            return False
+        u, ts_str, sig = parts
+        if str(u) != str(user):
+            return False
+        payload = f"{u}|{ts_str}"
+        expected = hmac.new(_get_local_auth_secret(), payload.encode("utf-8"), digestmod=_hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(str(sig), str(expected)):
+            return False
+        ts = int(ts_str)
+        if ts <= 0:
+            return False
+        age = int(_time.time()) - ts
+        return age <= int(ttl_days) * 24 * 3600
+    except Exception:
+        return False
+
+def _restore_local_auth_from_query_params() -> None:
+    """Se nei query params ci sono uwu/uwt validi, ripristina l'autenticazione locale."""
+    try:
+        if st.session_state.get("auth_logged_in") and st.session_state.get("auth_user"):
+            return
+        try:
+            qp = st.query_params
+            uwu = qp.get("uwu", None)
+            uwt = qp.get("uwt", None)
+        except Exception:
+            qp = st.experimental_get_query_params()
+            uwu = qp.get("uwu", [None])
+            uwt = qp.get("uwt", [None])
+        if isinstance(uwu, list):
+            uwu = uwu[0] if uwu else None
+        if isinstance(uwt, list):
+            uwt = uwt[0] if uwt else None
+        uwu = str(uwu).strip() if uwu else ""
+        uwt = str(uwt).strip() if uwt else ""
+        if uwu and uwt and _validate_local_auth_token(uwu, uwt):
+            st.session_state["auth_logged_in"] = True
+            st.session_state["auth_user"] = uwu
+            st.session_state["auth_token"] = uwt
+    except Exception:
+        pass
 
 def _get_auth_provider() -> str | None:
     try:
@@ -177,42 +259,9 @@ def _render_local_auth_page() -> None:
         s = (s or "").strip().lower()
         s = _re.sub(r"[^a-z0-9_\-\.]+", "_", s)
         return s[:64] if s else ""
-    def _is_writable_dir(p: Path) -> bool:
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            test = p / ".uw_write_test"
-            test.write_text("ok", encoding="utf-8")
-            test.unlink(missing_ok=True)
-            return True
-        except Exception:
-            return False
 
-    def _get_auth_storage_dir() -> Path:
-        """Sceglie una directory *scrivibile* e ragionevolmente persistente per salvare le utenze.
-
-        Nota: su alcune piattaforme (es. Streamlit Cloud) la cartella dell'app può essere read-only
-        e/o effimera; per questo si preferisce la home (es. ~/.streamlit).
-        """
-        # 1) esplicita via env
-        env_dir = os.getenv("UW_AUTH_STORAGE_DIR", "").strip()
-        candidates = []
-        if env_dir:
-            candidates.append(Path(env_dir).expanduser())
-        # 2) home: tipicamente persistente
-        candidates.append(Path.home() / ".streamlit" / "auth_storage")
-        # 3) progetto: utile in locale
-        candidates.append(Path.cwd() / ".streamlit" / "auth_storage")
-        candidates.append(Path.cwd() / "auth_storage")
-
-        for c in candidates:
-            if _is_writable_dir(c):
-                return c
-        # fallback: tmp (non persistente, ma evita crash)
-        tmp = Path(os.getenv("TMPDIR", "/tmp")) / "auth_storage"
-        tmp.mkdir(parents=True, exist_ok=True)
-        return tmp
-
-    AUTH_DIR = _get_auth_storage_dir()
+    AUTH_DIR = Path(__file__).resolve().parent / "auth_storage"
+    AUTH_DIR.mkdir(exist_ok=True)
     AUTH_DB = AUTH_DIR / "users.pkl"
 
     def _load_users() -> dict:
@@ -273,6 +322,17 @@ def _render_local_auth_page() -> None:
                 if _verify_pwd(pwd, rec.get("pwd_hash", ""), rec.get("pwd_salt", "")):
                     st.session_state["auth_logged_in"] = True
                     st.session_state["auth_user"] = u
+                    tok = _make_local_auth_token(u)
+                    st.session_state["auth_token"] = tok
+                    # Propaga token nei query params per mantenere la sessione anche su navigazione via link
+                    try:
+                        st.query_params["uwu"] = u
+                        st.query_params["uwt"] = tok
+                    except Exception:
+                        try:
+                            st.experimental_set_query_params(uwu=u, uwt=tok)
+                        except Exception:
+                            pass
                     st.success("Accesso effettuato.")
                     st.rerun()
                 else:
@@ -336,6 +396,7 @@ def _resolve_user_id() -> str:
 
     # --- Local auth (username/password) ---
     if mode == "local":
+        _restore_local_auth_from_query_params()
         # Se già loggato, ritorna subito l'utente
         if st.session_state.get("auth_logged_in") and st.session_state.get("auth_user"):
             return str(st.session_state.get("auth_user"))
@@ -394,42 +455,9 @@ def _resolve_user_id() -> str:
         s = (s or "").strip().lower()
         s = _re.sub(r"[^a-z0-9_\-\.]+", "_", s)
         return s[:64] if s else ""
-    def _is_writable_dir(p: Path) -> bool:
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            test = p / ".uw_write_test"
-            test.write_text("ok", encoding="utf-8")
-            test.unlink(missing_ok=True)
-            return True
-        except Exception:
-            return False
 
-    def _get_auth_storage_dir() -> Path:
-        """Sceglie una directory *scrivibile* e ragionevolmente persistente per salvare le utenze.
-
-        Nota: su alcune piattaforme (es. Streamlit Cloud) la cartella dell'app può essere read-only
-        e/o effimera; per questo si preferisce la home (es. ~/.streamlit).
-        """
-        # 1) esplicita via env
-        env_dir = os.getenv("UW_AUTH_STORAGE_DIR", "").strip()
-        candidates = []
-        if env_dir:
-            candidates.append(Path(env_dir).expanduser())
-        # 2) home: tipicamente persistente
-        candidates.append(Path.home() / ".streamlit" / "auth_storage")
-        # 3) progetto: utile in locale
-        candidates.append(Path.cwd() / ".streamlit" / "auth_storage")
-        candidates.append(Path.cwd() / "auth_storage")
-
-        for c in candidates:
-            if _is_writable_dir(c):
-                return c
-        # fallback: tmp (non persistente, ma evita crash)
-        tmp = Path(os.getenv("TMPDIR", "/tmp")) / "auth_storage"
-        tmp.mkdir(parents=True, exist_ok=True)
-        return tmp
-
-    AUTH_DIR = _get_auth_storage_dir()
+    AUTH_DIR = Path(__file__).resolve().parent / "auth_storage"
+    AUTH_DIR.mkdir(exist_ok=True)
     AUTH_DB = AUTH_DIR / "users.pkl"
 
     def _load_users() -> dict:
@@ -566,26 +594,74 @@ def _get_query_param_value(key: str) -> str | None:
     return s if s else None
 
 def _handle_app_actions() -> None:
-    # Logout richiesto dalla navbar (solo in PROD)
+    """Gestisce azioni via query params (es. logout)."""
     action = _get_query_param_value("action")
-    # Logout in modalità LOCAL
-    if APP_MODE == "prod" and str(globals().get('AUTH_MODE','local')).lower() == "local" and action == "logout":
-        st.session_state["auth_logged_in"] = False
-        st.session_state["auth_user"] = None
-        st.session_state.pop("auth_name", None)
-        st.session_state.pop("auth_surname", None)
-        st.session_state.pop("auth_address", None)
-        st.experimental_set_query_params()  # pulisce i parametri
-        st.rerun()
-    if APP_MODE == "prod" and action == "logout":
-        # st.logout() avvia una nuova sessione e torna alla home
+    if not action:
+        return
+
+    if str(action).strip().lower() == "logout":
+        # Reset sessione auth (locale o OIDC) + pulizia query params
         try:
-            st.logout()
+            for k in ("auth_logged_in", "auth_user", "auth_token"):
+                if k in st.session_state:
+                    st.session_state.pop(k, None)
         except Exception:
             pass
-        st.stop()
+
+        # Pulizia query params (compatibile vecchie API)
+        try:
+            # Nuova API (st.query_params)
+            st.query_params.clear()
+        except Exception:
+            try:
+                st.experimental_set_query_params()
+            except Exception:
+                pass
+
+        # Se presente, esegue logout OIDC (non necessario in locale, ma innocuo se non supportato)
+        try:
+            if hasattr(st, "logout"):
+                st.logout()
+        except Exception:
+            pass
+
+        st.rerun()
+
+
+def _render_floating_logout_button() -> None:
+    """Pulsante logout non invasivo (in alto a destra) visibile solo dentro l'app."""
+    try:
+        if not st.session_state.get("auth_logged_in"):
+            return
+    except Exception:
+        return
+
+    # Stile minimal e non invasivo
+    st.markdown(
+        """<style>
+        .uw-logout { position: fixed; top: 10px; right: 14px; z-index: 99999; }
+        .uw-logout a{
+            display:inline-block; padding:6px 10px; border-radius: 10px;
+            font-size: 12px; text-decoration:none;
+            border: 1px solid rgba(0,0,0,0.15);
+            background: rgba(255,255,255,0.85);
+            color: rgba(0,0,0,0.75);
+        }
+        .uw-logout a:hover{
+            background: rgba(255,255,255,1.0);
+            color: rgba(0,0,0,0.9);
+            border-color: rgba(0,0,0,0.25);
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+    # Link-azione: viene gestito da _handle_app_actions all'inizio del run successivo
+    st.markdown('<div class="uw-logout"><a href="?action=logout">Logout</a></div>', unsafe_allow_html=True)
+
 
 _handle_app_actions()
+_render_floating_logout_button()
 
 if "_user_storage" not in st.session_state:
     cfg = _get_storage_config()
@@ -1055,76 +1131,76 @@ NAVBAR_HTML_TEMPLATE = """
       <div class="uw-menus">
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Clienti%2FInvestitori" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Clienti%2FInvestitori" target="_self">
             Clienti/Investitori <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Clienti%2FInvestitori" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Clienti%2FInvestitori" target="_self">
               <b>Anagrafica</b><span>Gestione profili e dati cliente</span>
             </a>
           </div>
         </div>
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Crea%20Soluzione%20di%20Investimento" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento" target="_self">
             Crea Soluzione di Investimento <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Crea%20Soluzione%20di%20Investimento&crea=Asset-Only" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento&crea=Asset-Only" target="_self">
               <b>Asset-Only</b><span>Asset Allocation, Life Cycle, Monte Carlo</span>
             </a>
-            <a class="uw-dd-item" href="?main=Crea%20Soluzione%20di%20Investimento&crea=Goal-Based%20Investing" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento&crea=Goal-Based%20Investing" target="_self">
               <b>Goal-Based Investing</b><span>Soluzioni dinamiche per obiettivi</span>
             </a>
           </div>
         </div>
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Selezione%20Prodotti" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Selezione%20Prodotti" target="_self">
             Selezione Prodotti <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Selezione%20Prodotti" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Selezione%20Prodotti" target="_self">
               <b>Selezione Prodotti</b><span>Scelta degli strumenti per l’allocazione</span>
             </a>
           </div>
         </div>
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Monitoraggio%20Portafoglio" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Monitoraggio%20Portafoglio" target="_self">
             Monitoraggio Portafoglio <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Monitoraggio%20Portafoglio" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Monitoraggio%20Portafoglio" target="_self">
               <b>Monitoraggio Portafoglio</b><span>Andamento, scostamenti e alert di controllo</span>
             </a>
           </div>
         </div>
 
         <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Analisi%20Asset%20Allocation" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Analisi%20Asset%20Allocation" target="_self">
             Analisi Asset Allocation <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Analisi%20Asset%20Allocation" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Analisi%20Asset%20Allocation" target="_self">
               <b>Analisi Asset Allocation</b><span>Backtesting, rischio/rendimento, indicatori</span>
             </a>
           </div>
         </div>
 <div class="uw-dd">
-          <a class="uw-dd-btn" href="?main=Tools&tools=Griglie%20Clientela" target="_self">
+          <a class="uw-dd-btn" href="?{auth_qs}main=Tools&tools=Griglie%20Clientela" target="_self">
             Tools <span class="uw-caret"></span>
           </a>
           <div class="uw-dd-panel">
-            <a class="uw-dd-item" href="?main=Tools&tools=Griglie%20Clientela" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Griglie%20Clientela" target="_self">
               <b>Griglie Clientela</b><span>Profili e griglie obiettivo/rischio</span>
             </a>
-            <a class="uw-dd-item" href="?main=Tools&tools=Portafogli%20in%20Asset%20Class" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Portafogli%20in%20Asset%20Class" target="_self">
               <b>Portafogli in Asset Class</b><span>Frontiera e portafogli caricati</span>
             </a>
-            <a class="uw-dd-item" href="?main=Tools&tools=Database%20Prodotti" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Database%20Prodotti" target="_self">
               <b>Database Prodotti</b><span>Upload universo ETF/fondi e metriche</span>
             </a>
-            <a class="uw-dd-item" href="?main=Tools&tools=Database%20Mercati" target="_self">
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Database%20Mercati" target="_self">
               <b>Database Mercati</b><span>Upload rendimenti e controlli qualità</span>
             </a>
           </div>
@@ -1203,18 +1279,41 @@ def _build_logo_html() -> str:
 def render_navbar() -> None:
     """Render della navbar premium.
     Usa st.html (Streamlit recente) se disponibile; altrimenti fallback su st.markdown unsafe.
+
+    Nota: per AUTH_MODE='local' la navbar usa link con query params; per evitare nuove richieste di login
+    propaghiamo (se presente) il token firmato uwu/uwt nei link.
     """
-    logout_html = ""
-    if APP_MODE == "prod":
-        try:
-            if bool(getattr(st.user, "is_logged_in", False)):
-                logout_html = '<a class="uw-logout" href="?action=logout" target="_self">Logout</a>'
-        except Exception:
-            pass
+    logout_html = ""  # logout disabilitato (richiesta utente)
+
+    # Prefisso querystring per persistenza auth locale (se disponibile)
+    auth_qs = ""
+    try:
+        if APP_MODE == "prod" and str(globals().get("AUTH_MODE", "local")).strip().lower() == "local":
+            import urllib.parse as _urlparse
+            try:
+                qp = st.query_params
+                uwu = qp.get("uwu", None)
+                uwt = qp.get("uwt", None)
+            except Exception:
+                qp = st.experimental_get_query_params()
+                uwu = qp.get("uwu", [None])
+                uwt = qp.get("uwt", [None])
+            if isinstance(uwu, list):
+                uwu = uwu[0] if uwu else None
+            if isinstance(uwt, list):
+                uwt = uwt[0] if uwt else None
+
+            uwu = (uwu or st.session_state.get("auth_user") or "").strip()
+            uwt = (uwt or st.session_state.get("auth_token") or "").strip()
+
+            if uwu and uwt:
+                auth_qs = f"uwu={_urlparse.quote(str(uwu))}&uwt={_urlparse.quote(str(uwt))}&"
+    except Exception:
+        auth_qs = ""
 
     avatar_txt = _avatar_initials_from_user()
     logo_html = _build_logo_html()
-    html = NAVBAR_HTML_TEMPLATE.format(logout_html=logout_html, avatar_txt=avatar_txt, logo_html=logo_html)
+    html = NAVBAR_HTML_TEMPLATE.format(logout_html=logout_html, avatar_txt=avatar_txt, logo_html=logo_html, auth_qs=auth_qs)
 
     # Streamlit recente espone st.html() (render HTML in-page). Se non disponibile, fallback a markdown.
     try:
@@ -3595,7 +3694,7 @@ def _render_ai_products_from_portfolio(client_key: str, pid: str, payload: dict)
 
     if not (isinstance(db, dict) and isinstance(db.get("df"), pd.DataFrame)):
         st.warning("Database Prodotti non disponibile. Carichi prima il file in Tools → Database Prodotti.")
-        st.markdown('👉 <a href="?main=Tools&tools=Database%20Prodotti" target="_self">Apri Tools → Database Prodotti</a>', unsafe_allow_html=True)
+        st.markdown('👉 <a href="?{auth_qs}main=Tools&tools=Database%20Prodotti" target="_self">Apri Tools → Database Prodotti</a>', unsafe_allow_html=True)
         return
 
     products_df = db["df"].copy()
@@ -4961,14 +5060,39 @@ def render_crea_portafoglio():
             labels.append(f"Y{year}-P{within}")
             amounts.append(float(periodic_amount) if p <= periodic_periods else 0.0)
 
-    contrib_df = pd.DataFrame({"Periodo": labels, "Conferimenti (€)": amounts})
-    fig_contrib = px.bar(contrib_df, x="Periodo", y="Conferimenti (€)")
-    fig_contrib.update_traces(marker_color="rgba(120, 200, 120, 0.8)")
+    # --- Grafico conferimenti: barre blu (iniziale+periodiche) + cumulato (verdino chiaro quasi trasparente)
+    cum_amounts = list(np.cumsum(np.array(amounts, dtype=float)))
+
+    fig_contrib = go.Figure()
+
+    # Cumulato (sfondo): verdino chiaro, quasi trasparente
+    fig_contrib.add_trace(go.Bar(
+    x=labels,
+    y=cum_amounts,
+    name="Conferimenti cumulati",
+    marker=dict(color="rgba(120, 200, 120, 0.22)", line=dict(width=0)),
+    width=0.90,
+    hovertemplate="Periodo: %{x}<br>Cumulato: %{y:,.0f} €<extra></extra>",
+    ))
+
+    # Conferimenti per periodo: blu (iniziale e versamenti periodici)
+    fig_contrib.add_trace(go.Bar(
+    x=labels,
+    y=amounts,
+    name="Conferimenti",
+    marker=dict(color="rgba(40, 120, 220, 0.85)", line=dict(width=0)),
+    width=0.55,
+    hovertemplate="Periodo: %{x}<br>Conferimento: %{y:,.0f} €<extra></extra>",
+    ))
+
     fig_contrib.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_title="",
-        yaxis_title="€"
+    barmode="overlay",
+    margin=dict(l=10, r=10, t=30, b=10),
+    xaxis_title="",
+    yaxis_title="€",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+
     st.plotly_chart(fig_contrib, use_container_width=True)
 
     # -----------------------
@@ -6127,12 +6251,45 @@ def render_crea_soluzione_gbi():
             amounts.append(float(periodic_amount) if p <= periodic_periods else 0.0)
 
     contrib_df = pd.DataFrame({"Periodo": labels_p, "Conferimenti (€)": amounts})
-    fig_contrib = px.bar(contrib_df, x="Periodo", y="Conferimenti (€)")
+
+    # Barre cumulate (iniziale + versamenti periodici)
+    contrib_df["Cumulato (€)"] = contrib_df["Conferimenti (€)"].cumsum()
+
+    # Grafico: cumulato (verdino chiaro, quasi trasparente) come sfondo + conferimenti come barre principali
+    x_vals = contrib_df["Periodo"].astype(str).tolist()
+    y_contrib = contrib_df["Conferimenti (€)"].astype(float).tolist()
+    y_cum = contrib_df["Cumulato (€)"].astype(float).tolist()
+
+    fig_contrib = go.Figure()
+
+    # Cumulato: verdino chiaro, quasi trasparente, barra più larga per essere visibile anche con overlay
+    fig_contrib.add_trace(go.Bar(
+        x=x_vals,
+        y=y_cum,
+        name="Cumulato conferimenti",
+        marker=dict(color="rgba(144, 238, 144, 0.22)", line=dict(width=0)),
+        width=0.88,
+        hovertemplate="%{x}<br>Cumulato: %{y:,.0f} €<extra></extra>",
+    ))
+
+    # Conferimenti: barre principali (iniziale e periodici) più strette, sopra al cumulato
+    fig_contrib.add_trace(go.Bar(
+        x=x_vals,
+        y=y_contrib,
+        name="Conferimenti",
+        marker=dict(color="rgba(31, 119, 180, 0.95)", line=dict(width=0)),
+        width=0.56,
+        hovertemplate="%{x}<br>Conferimento: %{y:,.0f} €<extra></extra>",
+    ))
+
     fig_contrib.update_layout(
+        barmode="overlay",
         margin=dict(l=10, r=10, t=30, b=10),
         xaxis_title="",
-        yaxis_title="€"
+        yaxis_title="€",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
     )
+
     st.plotly_chart(fig_contrib, use_container_width=True)
 
     # -----------------------
@@ -7654,6 +7811,47 @@ def render_crea_soluzione_gbi():
                         
                             xs_g, ys_g = _concat_paths_idx(show_idx)
                             fig_dyn = go.Figure()
+
+                            # ------------------------------------------------------------
+                            # Barre verdine (quasi trasparenti): cumulato conferimenti
+                            # (iniziale + versamenti periodici) come "sfondo" del grafico
+                            # ------------------------------------------------------------
+                            try:
+                                _mult = {"Mensile": 12, "Trimestrale": 4, "Semestrale": 2, "Annuale": 1}.get(freq, 1)
+                                _hY = int(horizon_years)
+                                _pY = int(periodic_years)
+
+                                if freq == "Annuale":
+                                    _t_years = [0.0] + [float(y) for y in range(1, _hY + 1)]
+                                    _flows = [float(initial_amount)] + [
+                                        float(periodic_amount) if y <= _pY else 0.0
+                                        for y in range(1, _hY + 1)
+                                    ]
+                                else:
+                                    _total_p = _hY * _mult
+                                    _periodic_p = _pY * _mult
+                                    _t_years = [0.0]
+                                    _flows = [float(initial_amount)]
+                                    for p in range(1, _total_p + 1):
+                                        _t_years.append(p / float(_mult))
+                                        _flows.append(float(periodic_amount) if p <= _periodic_p else 0.0)
+
+                                _cum = np.cumsum(np.array(_flows, dtype=float)).tolist()
+                                _bar_w = 0.60 / float(_mult)  # larghezza (in anni)
+                            except Exception:
+                                _t_years, _cum, _bar_w = [], [], None
+
+                            if _t_years and _cum:
+                                fig_dyn.add_trace(go.Bar(
+                                    x=_t_years,
+                                    y=_cum,
+                                    name="Cumulato conferimenti",
+                                    yaxis="y2",
+                                    marker=dict(color="rgba(144, 238, 144, 0.22)", line=dict(width=0)),
+                                    width=_bar_w,
+                                    hovertemplate="t=%{x:.2f} anni<br>Cumulato conferimenti: %{y:,.0f} €<extra></extra>",
+                                ))
+
                             fig_dyn.add_trace(go.Scatter(
                                 x=xs_g, y=ys_g,
                                 mode="lines",
@@ -7690,6 +7888,7 @@ def render_crea_soluzione_gbi():
                                 yaxis_title="Montante (€)",
                                 margin=dict(l=10, r=10, t=60, b=10),
                                 yaxis=dict(range=[y_min - pad, y_max + pad], automargin=True, showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False),
+                                yaxis2=dict(overlaying="y", matches="y", visible=False, showgrid=False, zeroline=False),
                                 xaxis=dict(automargin=True, showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False),
                                 hovermode="x unified",
                                 plot_bgcolor="white",
