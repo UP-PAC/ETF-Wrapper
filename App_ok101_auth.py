@@ -5335,6 +5335,16 @@ def render_monitoraggio_portafoglio():
         unsafe_allow_html=True,
     )
 
+    # ---------------------------------------------------------------------
+    # Contesto riformulazione GBI (non deve impattare il monitoraggio)
+    # ---------------------------------------------------------------------
+    reform_ctx = st.session_state.get("gbi_reform_ctx", None)
+    is_reform = (
+        isinstance(reform_ctx, dict)
+        and isinstance(reform_ctx.get("payload"), dict)
+        and bool(reform_ctx.get("pid"))
+    )
+
     # -----------------------------
     # Helpers (local)
     # -----------------------------
