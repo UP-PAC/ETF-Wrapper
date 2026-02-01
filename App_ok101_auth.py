@@ -674,6 +674,7 @@ _STORAGE: UserStorage = st.session_state["_user_storage"]
 # =======================
 from pathlib import Path
 import pickle
+import datetime as dt
 
 _STORAGE_DIR = Path(__file__).resolve().parent / "app_storage"
 _STORAGE_DIR.mkdir(exist_ok=True)
@@ -4948,17 +4949,1390 @@ load_persisted_portfolios_into_session()
 # =======================
 # Sezione → Monitoraggio Portafoglio
 # =======================
+
+def ensure_portfolio_operations_storage():
+    """Inizializza e ricarica le operazioni di portafoglio (per-utente)."""
+    if "portfolio_operations" not in st.session_state or not isinstance(st.session_state.get("portfolio_operations"), dict):
+        st.session_state["portfolio_operations"] = {}
+    # reload per-utente (utile dopo cambio sezione / reload sessione)
+    persisted = _STORAGE.load(_USER_ID, "portfolio_operations", None)
+    if isinstance(persisted, dict) and len(persisted) > 0:
+        # merge: sessione prevale solo se già presente
+        for k, v in persisted.items():
+            if k not in st.session_state["portfolio_operations"]:
+                st.session_state["portfolio_operations"][k] = v
+
+def persist_portfolio_operations_from_session() -> None:
+    ops = st.session_state.get("portfolio_operations", {})
+    if isinstance(ops, dict):
+        _STORAGE.save(_USER_ID, "portfolio_operations", ops)
+
+def build_operations_template_excel_bytes() -> bytes:
+    """Template Excel per upload operazioni."""
+    df = pd.DataFrame({
+        "Data": ["2024-01-01", "2024-02-01", "2024-06-15"],
+        "Operazione": ["BUY", "BUY", "SELL"],
+        "ISIN": ["IE00EXAMPLE1", "IE00EXAMPLE2", "IE00EXAMPLE1"],
+        "Nome Prodotto": ["ETF Azionario Globale", "ETF Obbligazionario Globale", "ETF Azionario Globale"],
+        "Asset Class": ["Azionario Globale", "Obbligazionario Globale", "Azionario Globale"],
+        "Quantità": [10, 20, 3],
+        "Prezzo": [100.0, 50.0, 110.0],
+        "Commissioni": [1.5, 1.5, 1.5],
+        "Valuta": ["EUR", "EUR", "EUR"],
+        "Note": ["", "", ""],
+    })
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Operazioni")
+        # foglio istruzioni
+        instr = pd.DataFrame({
+            "Campo": ["Data", "Operazione", "ISIN", "Nome Prodotto", "Asset Class", "Quantità", "Prezzo", "Commissioni", "Valuta"],
+            "Note": [
+                "Formato YYYY-MM-DD",
+                "BUY o SELL (maiuscolo)",
+                "Opzionale ma consigliato",
+                "Obbligatorio se ISIN mancante",
+                "Opzionale (se assente si tenterà lookup dal Database Prodotti)",
+                "Numero (positivo)",
+                "Prezzo unitario",
+                "Costo totale dell'operazione (>=0)",
+                "Opzionale; default EUR",
+            ]
+        })
+        instr.to_excel(writer, index=False, sheet_name="Istruzioni")
+    return bio.getvalue()
+
+def _parse_operations_excel(uploaded_file) -> pd.DataFrame:
+    xls = pd.read_excel(uploaded_file, sheet_name=0)
+    # normalizza nomi colonne
+    cols = {c.strip(): c for c in xls.columns}
+    def _pick(*names):
+        for n in names:
+            if n in cols:
+                return cols[n]
+        return None
+
+    c_date = _pick("Data", "Date")
+    c_op = _pick("Operazione", "Operation", "Tipo", "Side")
+    c_isin = _pick("ISIN", "Isin")
+    c_name = _pick("Nome Prodotto", "Prodotto", "Product", "Nome")
+    c_ac = _pick("Asset Class", "AssetClass", "Mercato", "Mercato/Asset Class")
+    c_qty = _pick("Quantità", "Quantita", "Quantity", "Qta")
+    c_px = _pick("Prezzo", "Price")
+    c_fee = _pick("Commissioni", "Fees", "Fee", "Commissione")
+    c_ccy = _pick("Valuta", "Currency", "CCY")
+    c_note = _pick("Note", "Notes")
+
+    req = [c_date, c_op, c_qty, c_px]
+    if any(x is None for x in req):
+        raise ValueError("Template non riconosciuto: servono almeno le colonne Data, Operazione, Quantità, Prezzo.")
+
+    df = pd.DataFrame()
+    df["date"] = pd.to_datetime(xls[c_date]).dt.tz_localize(None)
+    df["side"] = xls[c_op].astype(str).str.strip().str.upper()
+    df["isin"] = "" if c_isin is None else xls[c_isin].astype(str).str.strip()
+    df["product_name"] = "" if c_name is None else xls[c_name].astype(str).str.strip()
+    df["asset_class"] = "" if c_ac is None else xls[c_ac].astype(str).str.strip()
+    df["qty"] = pd.to_numeric(xls[c_qty], errors="coerce").fillna(0.0).astype(float)
+    df["price"] = pd.to_numeric(xls[c_px], errors="coerce").fillna(0.0).astype(float)
+    df["fees"] = 0.0 if c_fee is None else pd.to_numeric(xls[c_fee], errors="coerce").fillna(0.0).astype(float)
+    df["ccy"] = "EUR" if c_ccy is None else xls[c_ccy].astype(str).str.strip().replace({"": "EUR"})
+    df["note"] = "" if c_note is None else xls[c_note].astype(str)
+
+    df = df[df["date"].notna()].copy()
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # validazioni minime
+    bad_side = ~df["side"].isin(["BUY", "SELL"])
+    if bad_side.any():
+        raise ValueError("Colonna Operazione: usare solo BUY o SELL.")
+    if (df["qty"] <= 0).any():
+        raise ValueError("Quantità deve essere > 0 per tutte le righe.")
+    if (df["price"] <= 0).any():
+        raise ValueError("Prezzo deve essere > 0 per tutte le righe.")
+    if (df["fees"] < 0).any():
+        raise ValueError("Commissioni non possono essere negative.")
+    return df
+
+def _xnpv(rate: float, cashflows: list[tuple[dt.datetime, float]]) -> float:
+    t0 = cashflows[0][0]
+    return sum(cf / ((1 + rate) ** ((d - t0).days / 365.25)) for d, cf in cashflows)
+
+def _xirr(cashflows: list[tuple[dt.datetime, float]], guess: float = 0.05) -> float | None:
+    """XIRR con Newton; ritorna None se non converge o flussi non idonei."""
+    if len(cashflows) < 2:
+        return None
+    # serve almeno un flusso positivo e uno negativo
+    vals = [v for _, v in cashflows]
+    if not (any(v > 0 for v in vals) and any(v < 0 for v in vals)):
+        return None
+
+    rate = float(guess)
+    for _ in range(100):
+        f = _xnpv(rate, cashflows)
+        # derivata numerica
+        eps = 1e-6
+        f1 = _xnpv(rate + eps, cashflows)
+        d = (f1 - f) / eps
+        if abs(d) < 1e-12:
+            break
+        new = rate - f / d
+        if not np.isfinite(new):
+            break
+        if abs(new - rate) < 1e-10:
+            return float(new)
+        rate = new
+    return None
+
+def _get_portfolio_target_weights_over_years(payload: dict) -> pd.DataFrame:
+    """Ritorna DataFrame con colonne: year, <asset_class...> con pesi (0..1)."""
+    comp_path = payload.get("composition_path", []) or []
+    if isinstance(comp_path, list) and len(comp_path) > 0 and isinstance(comp_path[0], dict):
+        df = pd.DataFrame(comp_path).copy()
+    else:
+        # fallback: solo composizione iniziale
+        comp0 = payload.get("composition", {}) or {}
+        df = pd.DataFrame([{"year": 0, **comp0}])
+    # normalizza
+    if "year" not in df.columns:
+        if "t" in df.columns:
+            df = df.rename(columns={"t": "year"})
+        else:
+            df.insert(0, "year", np.arange(df.shape[0]))
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(0).astype(int)
+    # to 0..1
+    for c in df.columns:
+        if c == "year":
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float)
+        # se è in percentuale (0..100) lo riportiamo a 0..1
+        if df[c].max() > 1.5:
+            df[c] = df[c] / 100.0
+    return df.sort_values("year").reset_index(drop=True)
+
+def _planned_cashflows_monthly(payload: dict, start_date: dt.datetime) -> pd.Series:
+    """Serie mensile di flussi pianificati (negativi=conferimenti; positivi=spese)."""
+    horizon_years = int(payload.get("horizon_years", 0) or 0)
+    months = max(1, horizon_years * 12)
+
+    idx = pd.date_range(start=start_date, periods=months + 1, freq="MS")  # include mese 0
+    cf = pd.Series(0.0, index=idx)
+
+    # conferimento iniziale al mese 0
+    init_amt = float(payload.get("initial_amount", 0.0) or 0.0)
+    if init_amt != 0:
+        cf.iloc[0] += -abs(init_amt)
+
+    # conferimenti periodici
+    per_amt = float(payload.get("periodic_amount", 0.0) or 0.0)
+    per_years = int(payload.get("periodic_years", 0) or 0)
+    freq = str(payload.get("periodic_freq", "Mensile"))
+    if per_amt != 0 and per_years > 0:
+        n_months = min(months, per_years * 12)
+        if freq.lower().startswith("men"):
+            step = 1
+        elif freq.lower().startswith("tri"):
+            step = 3
+        elif freq.lower().startswith("sem"):
+            step = 6
+        else:
+            step = 12
+        for m in range(step, n_months + 1, step):
+            cf.iloc[m] += -abs(per_amt)
+
+    # spese obiettivi (GBI)
+    if bool(payload.get("gbi", False)) and isinstance(payload.get("gbi_objectives"), list):
+        for obj in payload.get("gbi_objectives", []):
+            mo = int(obj.get("month", obj.get("m", 0)) or 0)
+            amt = float(obj.get("amount", obj.get("amt", 0.0)) or 0.0)
+            if 0 <= mo <= months and amt != 0:
+                # qui la spesa è una "uscita" dal punto di vista della ricchezza,
+                # ma nella richiesta utente va mostrata sopra l'asse (segno positivo).
+                cf.iloc[mo] += abs(amt)
+
+    return cf
+
+def _ops_to_cashflows(df_ops: pd.DataFrame) -> pd.Series:
+    """Serie mensile di flussi effettivi (neg=investimenti BUY; pos=disinvestimenti SELL)."""
+    if df_ops is None or df_ops.empty:
+        return pd.Series(dtype=float)
+    d0 = df_ops["date"].min().replace(day=1)
+    d1 = df_ops["date"].max().replace(day=1)
+    idx = pd.date_range(start=d0, end=d1, freq="MS")
+    s = pd.Series(0.0, index=idx)
+    for _, r in df_ops.iterrows():
+        d = pd.Timestamp(r["date"]).replace(day=1)
+        amt = float(r["qty"] * r["price"] + r["fees"])
+        if r["side"] == "BUY":
+            s.loc[d] += -abs(amt)
+        else:
+            s.loc[d] += abs(max(0.0, r["qty"] * r["price"] - r["fees"]))
+    return s
+
+def _compute_holdings_and_values(df_ops: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    """Ritorna (holdings_df, total_value) usando ultimo prezzo noto per ogni prodotto."""
+    if df_ops is None or df_ops.empty:
+        return pd.DataFrame(columns=["isin","product_name","asset_class","qty","last_price","value"]), 0.0
+
+    # ultimo prezzo noto per prodotto
+    df_ops = df_ops.copy()
+    df_ops["key_prod"] = df_ops["isin"].where(df_ops["isin"].str.len() > 0, df_ops["product_name"])
+    df_ops["key_prod"] = df_ops["key_prod"].fillna("").astype(str)
+    last_price = df_ops.sort_values("date").groupby("key_prod")["price"].last()
+
+    # qty netta
+    def _signed_qty(side, q):
+        return q if side == "BUY" else -q
+
+    df_ops["signed_qty"] = df_ops.apply(lambda r: _signed_qty(r["side"], float(r["qty"])), axis=1)
+    qty = df_ops.groupby("key_prod")["signed_qty"].sum()
+
+    # anagrafiche prodotto
+    meta = df_ops.sort_values("date").groupby("key_prod").tail(1).set_index("key_prod")
+    out = pd.DataFrame({
+        "key_prod": qty.index,
+        "qty": qty.values,
+        "last_price": [float(last_price.get(k, 0.0) or 0.0) for k in qty.index],
+        "isin": [str(meta.loc[k, "isin"]) if k in meta.index else "" for k in qty.index],
+        "product_name": [str(meta.loc[k, "product_name"]) if k in meta.index else str(k) for k in qty.index],
+        "asset_class": [str(meta.loc[k, "asset_class"]) if k in meta.index else "" for k in qty.index],
+    })
+    out = out[out["qty"] > 1e-12].copy()
+    out["value"] = out["qty"] * out["last_price"]
+    total = float(out["value"].sum())
+    return out.sort_values("value", ascending=False).reset_index(drop=True), total
+
+def _map_products_to_asset_class(holdings: pd.DataFrame) -> pd.DataFrame:
+    """Se asset class mancante tenta lookup dal Database Prodotti (se disponibile)."""
+    if holdings is None or holdings.empty:
+        return holdings
+    h = holdings.copy()
+
+    # se già compilata, ok
+    need = h["asset_class"].astype(str).str.strip().eq("") | h["asset_class"].isna()
+    if not need.any():
+        return h
+
+
+def _infer_trade_constraints_from_db(product_db: pd.DataFrame) -> dict:
+    """Prova a inferire vincoli operativi dal Database Prodotti.
+    Restituisce un dict con possibili colonne: lot_size, min_trade_value, commission_fixed, commission_pct.
+    Se non disponibili, i default saranno gestiti a livello UI.
+    """
+    if product_db is None or not isinstance(product_db, pd.DataFrame) or product_db.empty:
+        return {}
+    cols = {c.lower().strip(): c for c in product_db.columns}
+    out = {}
+    # colonne tipiche (tolleranti)
+    out["lot_size_col"] = cols.get("lotto") or cols.get("lotto minimo") or cols.get("lot size") or cols.get("min lot") or cols.get("minimo quote") or cols.get("minimo quote/pezzi")
+    out["min_trade_value_col"] = cols.get("minimo investimento") or cols.get("importo minimo") or cols.get("min trade value") or cols.get("minimo operazione")
+    out["commission_fixed_col"] = cols.get("commissione fissa") or cols.get("commissione") or cols.get("fee fissa")
+    out["commission_pct_col"] = cols.get("commissione %") or cols.get("commissione percentuale") or cols.get("fee %") or cols.get("fee pct")
+    out["ter_col"] = cols.get("ter") or cols.get("ongoing charges") or cols.get("spese correnti")
+    out["isin_col"] = cols.get("isin")
+    out["name_col"] = cols.get("nome") or cols.get("name") or cols.get("prodotto") or cols.get("product")
+    out["asset_class_col"] = cols.get("asset class") or cols.get("asset_class") or cols.get("assetclass") or cols.get("mercato") or cols.get("benchmark")
+    return out
+
+def _pick_candidate_products_for_asset_class(asset_class: str, product_db: pd.DataFrame, db_cols: dict, k: int = 5) -> pd.DataFrame:
+    """Seleziona candidati (fallback) dal DB prodotti per una asset class."""
+    if product_db is None or not isinstance(product_db, pd.DataFrame) or product_db.empty:
+        return pd.DataFrame()
+    ac_col = db_cols.get("asset_class_col")
+    if not ac_col:
+        return pd.DataFrame()
+    df = product_db.copy()
+    m = df[ac_col].astype(str).str.strip().str.lower() == str(asset_class).strip().lower()
+    df = df[m].copy()
+    if df.empty:
+        return df
+    ter_col = db_cols.get("ter_col")
+    if ter_col and ter_col in df.columns:
+        # prendo i più economici
+        df["_ter"] = pd.to_numeric(df[ter_col], errors="coerce")
+        df = df.sort_values(["_ter"]).drop(columns=["_ter"], errors="ignore")
+    return df.head(int(k)).copy()
+
+def _suggest_rebalance_trades_per_product(
+    holdings: pd.DataFrame,
+    target_weights: dict,
+    total_value: float,
+    product_db: pd.DataFrame | None,
+    *,
+    lot_size_default: float = 1.0,
+    min_trade_value_default: float = 0.0,
+    commission_fixed_default: float = 0.0,
+    commission_pct_default: float = 0.0,
+) -> tuple[pd.DataFrame, dict]:
+    """Genera una lista ordini BUY/SELL per riallineare ai pesi target.
+    - Vende proporzionalmente i prodotti in eccesso dentro ciascuna asset class.
+    - Compra prioritariamente su prodotti già presenti; se assenti, sceglie un candidato dal DB prodotti.
+    Applica:
+    - lotto minimo (arrotondamento su qty),
+    - minimo importo operazione (filtra ordini piccoli),
+    - costi (commissione fissa + percentuale).
+    Ritorna (orders_df, diagnostics).
+    """
+    if holdings is None or holdings.empty or total_value <= 0:
+        return pd.DataFrame(), {"error": "holdings_empty_or_zero"}
+    h = holdings.copy()
+    h["asset_class"] = h["asset_class"].replace({"": "Non classificato"}).fillna("Non classificato")
+    h["last_price"] = pd.to_numeric(h["last_price"], errors="coerce").fillna(0.0)
+    h["qty"] = pd.to_numeric(h["qty"], errors="coerce").fillna(0.0)
+    h["value"] = pd.to_numeric(h["value"], errors="coerce").fillna(h["qty"] * h["last_price"])
+    by_ac = h.groupby("asset_class")["value"].sum().to_dict()
+    all_ac = sorted(set(list(by_ac.keys()) + list(target_weights.keys())))
+    # target value per AC
+    tgt_val = {a: float(target_weights.get(a, 0.0) or 0.0) * float(total_value) for a in all_ac}
+    cur_val = {a: float(by_ac.get(a, 0.0) or 0.0) for a in all_ac}
+    delta_val = {a: float(tgt_val[a] - cur_val[a]) for a in all_ac}  # + = buy, - = sell
+
+    # db columns inference
+    db_cols = _infer_trade_constraints_from_db(product_db) if isinstance(product_db, pd.DataFrame) else {}
+    isin_db = db_cols.get("isin_col")
+    name_db = db_cols.get("name_col")
+    ac_db = db_cols.get("asset_class_col")
+    lot_db = db_cols.get("lot_size_col")
+    minv_db = db_cols.get("min_trade_value_col")
+    cf_db = db_cols.get("commission_fixed_col")
+    cp_db = db_cols.get("commission_pct_col")
+
+    # helper: per-product constraints
+    def _constraints_for_product(isin: str, name: str) -> tuple[float,float,float,float]:
+        lot = float(lot_size_default)
+        minv = float(min_trade_value_default)
+        cfix = float(commission_fixed_default)
+        cpct = float(commission_pct_default)
+        if isinstance(product_db, pd.DataFrame) and not product_db.empty:
+            row = None
+            try:
+                if isin_db and isin:
+                    m = product_db[product_db[isin_db].astype(str).str.strip() == str(isin).strip()]
+                    if len(m) > 0:
+                        row = m.iloc[0]
+                if row is None and name_db and name:
+                    m = product_db[product_db[name_db].astype(str).str.strip().str.lower() == str(name).strip().lower()]
+                    if len(m) > 0:
+                        row = m.iloc[0]
+            except Exception:
+                row = None
+            if row is not None:
+                try:
+                    if lot_db and lot_db in product_db.columns:
+                        lot = float(pd.to_numeric(row.get(lot_db), errors="coerce") or lot)
+                except Exception:
+                    pass
+                try:
+                    if minv_db and minv_db in product_db.columns:
+                        minv = float(pd.to_numeric(row.get(minv_db), errors="coerce") or minv)
+                except Exception:
+                    pass
+                try:
+                    if cf_db and cf_db in product_db.columns:
+                        cfix = float(pd.to_numeric(row.get(cf_db), errors="coerce") or cfix)
+                except Exception:
+                    pass
+                try:
+                    if cp_db and cp_db in product_db.columns:
+                        cpct = float(pd.to_numeric(row.get(cp_db), errors="coerce") or cpct)
+                except Exception:
+                    pass
+        lot = max(lot, 1e-12)
+        minv = max(minv, 0.0)
+        cfix = max(cfix, 0.0)
+        cpct = max(cpct, 0.0)
+        if cpct > 1.0:
+            cpct = cpct / 100.0
+        return lot, minv, cfix, cpct
+
+    orders = []
+    residual_cash = 0.0
+
+    # 1) SELL per asset class overweight
+    for ac in all_ac:
+        dv = float(delta_val.get(ac, 0.0))
+        if dv >= 0:
+            continue
+        need_sell = abs(dv)
+        sub = h[h["asset_class"] == ac].copy()
+        if sub.empty:
+            continue
+        # vende proporzionalmente al valore
+        sub["w"] = sub["value"] / max(sub["value"].sum(), 1e-12)
+        for _, r in sub.iterrows():
+            alloc_sell = need_sell * float(r["w"])
+            px = float(r["last_price"] or 0.0)
+            if px <= 0:
+                continue
+            lot, minv, cfix, cpct = _constraints_for_product(str(r.get("isin","")), str(r.get("product_name","")))
+            qty_raw = alloc_sell / px
+            # arrotondo al lotto (SELL -> floor)
+            qty = math.floor(qty_raw / lot) * lot
+            qty = min(float(qty), float(r["qty"]))  # non oltre la posizione
+            if qty <= 0:
+                continue
+            notional = qty * px
+            if notional < minv:
+                # se troppo piccolo, non eseguo; accumulo residual cash "non venduto"
+                continue
+            costs = cfix + cpct * notional
+            orders.append({
+                "Side": "SELL",
+                "ISIN": str(r.get("isin","")),
+                "Prodotto": str(r.get("product_name","")),
+                "Asset Class": ac,
+                "Prezzo": px,
+                "Qty": qty,
+                "Controvalore (€)": notional,
+                "Costi stimati (€)": costs,
+                "Cash impact (€)": notional - costs,
+                "Note": f"Vendita per riduzione peso {ac}"
+            })
+            residual_cash += (notional - costs)  # cash generato
+
+    # 2) BUY per asset class underweight
+    for ac in all_ac:
+        dv = float(delta_val.get(ac, 0.0))
+        if dv <= 0:
+            continue
+        need_buy = dv
+        # candidati: prima prodotti già presenti in AC
+        sub = h[h["asset_class"] == ac].copy()
+        candidates = []
+        if not sub.empty:
+            # compra proporzionalmente al valore esistente
+            sub["w"] = sub["value"] / max(sub["value"].sum(), 1e-12)
+            for _, r in sub.iterrows():
+                candidates.append((str(r.get("isin","")), str(r.get("product_name","")), float(r["last_price"] or 0.0), float(r["w"])))
+        else:
+            # fallback: scegli 1-3 prodotti dal DB
+            cand = _pick_candidate_products_for_asset_class(ac, product_db, db_cols, k=3)
+            if isinstance(cand, pd.DataFrame) and not cand.empty:
+                for j in range(len(cand)):
+                    rr = cand.iloc[j]
+                    isin = str(rr.get(isin_db,"")) if isin_db else ""
+                    nm = str(rr.get(name_db,"")) if name_db else f"{ac} - candidato"
+                    # prezzo non noto qui: lo lasciamo a 0 e richiederà input; fallback: non compra
+                    candidates.append((isin, nm, 0.0, 1.0/len(cand)))
+
+        for isin, nm, px, w in candidates:
+            if w <= 0:
+                continue
+            alloc_buy = need_buy * float(w)
+            if px <= 0:
+                # prezzo non disponibile: salta con nota
+                orders.append({
+                    "Side": "BUY",
+                    "ISIN": isin,
+                    "Prodotto": nm,
+                    "Asset Class": ac,
+                    "Prezzo": px,
+                    "Qty": 0.0,
+                    "Controvalore (€)": 0.0,
+                    "Costi stimati (€)": 0.0,
+                    "Cash impact (€)": 0.0,
+                    "Note": "Prezzo non disponibile: inserire prezzo e ricalcolare."
+                })
+                continue
+            lot, minv, cfix, cpct = _constraints_for_product(isin, nm)
+            qty_raw = alloc_buy / px
+            # BUY -> ceil al lotto
+            qty = math.ceil(qty_raw / lot) * lot
+            if qty <= 0:
+                continue
+            notional = qty * px
+            if notional < minv:
+                continue
+            costs = cfix + cpct * notional
+            orders.append({
+                "Side": "BUY",
+                "ISIN": isin,
+                "Prodotto": nm,
+                "Asset Class": ac,
+                "Prezzo": px,
+                "Qty": qty,
+                "Controvalore (€)": notional,
+                "Costi stimati (€)": costs,
+                "Cash impact (€)": -(notional + costs),
+                "Note": f"Acquisto per incremento peso {ac}"
+            })
+            residual_cash -= (notional + costs)  # cash usato
+
+    odf = pd.DataFrame(orders)
+    if not odf.empty:
+        # format + ordering
+        for c in ["Prezzo","Qty","Controvalore (€)","Costi stimati (€)","Cash impact (€)"]:
+            if c in odf.columns:
+                odf[c] = pd.to_numeric(odf[c], errors="coerce").fillna(0.0)
+        odf = odf.sort_values(["Side","Asset Class","Controvalore (€)"], ascending=[True, True, False]).reset_index(drop=True)
+    diag = {"residual_cash_estimate": float(residual_cash)}
+    return odf, diag
+
+
+    pdb = st.session_state.get("product_database", None)
+    if isinstance(pdb, dict) and isinstance(pdb.get("df"), pd.DataFrame):
+        dfp = pdb["df"].copy()
+        cols = {c.lower(): c for c in dfp.columns}
+        isin_col = cols.get("isin")
+        name_col = cols.get("nome") or cols.get("name") or cols.get("prodotto") or cols.get("product")
+        ac_col = cols.get("asset class") or cols.get("asset_class") or cols.get("assetclass") or cols.get("mercato") or cols.get("benchmark")
+        if ac_col:
+            def _lookup(row):
+                if str(row.get("asset_class","")).strip():
+                    return row["asset_class"]
+                isin = str(row.get("isin","")).strip()
+                if isin_col and isin:
+                    m = dfp[dfp[isin_col].astype(str).str.strip() == isin]
+                    if len(m) > 0:
+                        return str(m.iloc[0][ac_col])
+                if name_col:
+                    nm = str(row.get("product_name","")).strip().lower()
+                    m = dfp[dfp[name_col].astype(str).str.strip().str.lower() == nm]
+                    if len(m) > 0:
+                        return str(m.iloc[0][ac_col])
+                return row.get("asset_class","")
+            h["asset_class"] = h.apply(_lookup, axis=1)
+    return h
+
+def _simulate_portfolio_paths(payload: dict, start_date: dt.datetime, n_scen: int = 1000, seed: int = 7):
+    """Montecarlo basato sul Database Mercati (rendimenti storici). Ritorna array (scen, months+1) wealth."""
+    ensure_market_database_storage()
+    db = st.session_state.get("market_database", None)
+    if not (isinstance(db, dict) and isinstance(db.get("df"), pd.DataFrame)):
+        return None, "Database Mercati non disponibile."
+
+    df_ret = db["df"].copy()
+    comp_df = _get_portfolio_target_weights_over_years(payload)
+    asset_cols = [c for c in comp_df.columns if c != "year"]
+
+    # filtra asset presenti nel db
+    missing = [a for a in asset_cols if a not in df_ret.columns]
+    if missing:
+        return None, f"Nel Database Mercati mancano le seguenti Asset Class: {', '.join(missing)}"
+
+    horizon_years = int(payload.get("horizon_years", 0) or 0)
+    months = max(1, horizon_years * 12)
+
+    R = df_ret[asset_cols].dropna(how="all").copy()
+    # stima input (mensili)
+    mu_m = R.mean().values.astype(float)
+    cov_m = R.cov().values.astype(float)
+    # robustezza
+    cov_m = cov_m + np.eye(cov_m.shape[0]) * 1e-12
+
+    # simulazione
+    rng = np.random.default_rng(int(seed))
+    L = np.linalg.cholesky(cov_m)
+    Z = rng.standard_normal(size=(int(n_scen) * int(months), len(asset_cols)))
+    X = Z @ L.T
+    R_sim = (X + mu_m).reshape(int(n_scen), int(months), len(asset_cols))  # (scen, months, assets)
+
+    # pesi dinamici per mese
+    w_month = np.zeros((months, len(asset_cols)), dtype=float)
+    for m in range(months):
+        y = int(m // 12)
+        row = comp_df[comp_df["year"] <= y].tail(1)
+        if len(row) == 0:
+            w = np.array([0.0]*len(asset_cols))
+        else:
+            w = row[asset_cols].iloc[0].values.astype(float)
+        s = float(np.sum(w))
+        if s <= 0:
+            w = np.ones(len(asset_cols))/len(asset_cols)
+        else:
+            w = w/s
+        w_month[m,:] = w
+
+    # flussi pianificati mensili (neg=conferimenti; pos=spese)
+    cf_plan = _planned_cashflows_monthly(payload, start_date)
+    cf_plan = cf_plan.reindex(pd.date_range(start=start_date, periods=months+1, freq="MS")).fillna(0.0).values.astype(float)
+
+    W = np.zeros((int(n_scen), months+1), dtype=float)
+    W[:,0] = 0.0
+    for m in range(months):
+        # applico flusso al principio del mese (conferimento o spesa)
+        W[:,m] = W[:,m] - cf_plan[m]  # cf_plan negativo aumenta W; positivo riduce W
+        port_r = (R_sim[:,m,:] * w_month[m,:]).sum(axis=1)
+        W[:,m+1] = np.maximum(0.0, W[:,m] * (1.0 + port_r))
+    return W, None
+
 def render_monitoraggio_portafoglio():
-    """
-    Sezione dedicata al monitoraggio del portafoglio (placeholder UI).
-    Nota: in questa fase non vengono introdotti calcoli nuovi; solo struttura di pagina.
-    """
+    """Monitoraggio Portafoglio."""
+    ensure_anagrafica_storage()
+    ensure_portfolio_storage()
+    ensure_portfolio_operations_storage()
+    ensure_market_database_storage()
+    ensure_product_database_storage()
+
     st.markdown(
         '<div class="uw-card"><h2>Monitoraggio Portafoglio</h2>'
-        "<p>Sezione predisposta per le funzionalità di monitoraggio (andamento, scostamenti, alert e reportistica). "
-        "Contenuti in sviluppo.</p></div>",
+        '<p>Selezioni un cliente e un portafoglio salvato, carichi le operazioni e ottiene le analisi di coerenza, composizione e performance.</p></div>',
         unsafe_allow_html=True,
     )
+
+    anags = st.session_state.get("anagrafiche", {}) or {}
+    pf_all = st.session_state.get("portfolios", {}) or {}
+    if not anags or not pf_all:
+        st.info("Per utilizzare il Monitoraggio occorre prima creare almeno una Anagrafica e un Portafoglio.")
+        return
+
+    # -------------------------
+    # (a) Seleziona Cliente
+    # -------------------------
+    client_keys = list(anags.keys())
+    client_labels = []
+    for k in client_keys:
+        d = anags[k].get("data", {})
+        client_labels.append(f'{d.get("nome","").strip()} {d.get("cognome","").strip()}  —  ({k})')
+
+    sel_client_label = st.selectbox("Seleziona Cliente / Investitore", client_labels, key="mon_client_sel")
+    client_key = client_keys[client_labels.index(sel_client_label)]
+
+    # -------------------------
+    # (b) Seleziona Portafoglio
+    # -------------------------
+    ids = st.session_state.get("client_portfolios", {}).get(client_key, []) or []
+    ids = [pid for pid in ids if pid in pf_all]
+    if not ids:
+        st.warning("Nessun portafoglio salvato per il cliente selezionato.")
+        return
+
+    pf_labels = []
+    for pid in ids:
+        p = pf_all.get(pid, {})
+        tag = "GBI" if bool(p.get("gbi", False)) else "Asset-Only"
+        pf_labels.append(f'{p.get("portfolio_name", pid)}  —  {tag}  —  ({pid})')
+
+    sel_pf_label = st.selectbox("Seleziona Portafoglio salvato", pf_labels, key="mon_pf_sel")
+    pid = ids[pf_labels.index(sel_pf_label)]
+    payload = pf_all.get(pid, {})
+
+    # -------------------------
+    # (c) Grafici struttura piano (AA dinamica + flussi)
+    # -------------------------
+    st.markdown('<div class="uw-card"><h3>Piano ex-ante (Asset Allocation e Flussi)</h3></div>', unsafe_allow_html=True)
+
+    # data di inizio monitoraggio: prima operazione (se presente), altrimenti oggi
+    df_ops_saved = st.session_state.get("portfolio_operations", {}).get(pid, None)
+    df_ops_saved = pd.DataFrame(df_ops_saved) if isinstance(df_ops_saved, (list, dict)) else df_ops_saved
+    if isinstance(df_ops_saved, pd.DataFrame) and not df_ops_saved.empty and "date" in df_ops_saved.columns:
+        start_date = pd.to_datetime(df_ops_saved["date"]).min().to_pydatetime()
+    else:
+        start_date = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # area chart AA
+    comp_df = _get_portfolio_target_weights_over_years(payload)
+    asset_cols = [c for c in comp_df.columns if c != "year"]
+    if len(asset_cols) > 0:
+        comp_long = comp_df.melt(id_vars=["year"], value_vars=asset_cols, var_name="Asset Class", value_name="Peso")
+        fig_area = px.area(comp_long, x="year", y="Peso", color="Asset Class", groupnorm="fraction")
+        fig_area.update_layout(height=360, yaxis_tickformat=".0%")
+        st.plotly_chart(fig_area, use_container_width=True)
+    else:
+        st.info("Asset allocation dinamica non disponibile nel portafoglio selezionato.")
+
+    # bar chart flussi (conferimenti negativi, spese positive)
+    cf_plan = _planned_cashflows_monthly(payload, start_date)
+    cf_df = cf_plan.reset_index()
+    cf_df.columns = ["Mese", "Flusso"]
+    cf_df["Anno"] = cf_df["Mese"].dt.year
+    cf_df["MeseNum"] = cf_df["Mese"].dt.month
+    cf_df["Periodo"] = cf_df["Mese"].dt.strftime("%Y-%m")
+
+    fig_cf = go.Figure()
+    fig_cf.add_trace(go.Bar(x=cf_df["Periodo"], y=cf_df["Flusso"], name="Flusso (neg=conferimenti, pos=spese)"))
+    fig_cf.update_layout(height=320, bargap=0.15, xaxis_title="Periodo", yaxis_title="€", xaxis_tickangle=-45)
+    st.plotly_chart(fig_cf, use_container_width=True)
+
+    # -------------------------
+    # (d) Carica il portafoglio (operazioni)
+    # -------------------------
+    st.markdown('<div class="uw-card"><h3>Carica il portafoglio</h3></div>', unsafe_allow_html=True)
+
+    mode = st.radio(
+        "Modalità",
+        ["Carica le operazioni con file excel", "Aggiungi il portfolio automaticamente (inattivo)"],
+        horizontal=True,
+        key="mon_ops_mode",
+    )
+
+    if mode.startswith("Carica"):
+        template_bytes = build_operations_template_excel_bytes()
+        st.download_button(
+            "Scarica Template Operazioni (Esempio)",
+            data=template_bytes,
+            file_name="template_operazioni_portafoglio.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="dl_template_ops",
+        )
+
+        up_ops = st.file_uploader("Upload Operazioni (Excel)", type=["xlsx","xls"], key="upload_ops")
+        parsed_ops = None
+        if up_ops is not None:
+            try:
+                parsed_ops = _parse_operations_excel(up_ops)
+                st.success("Operazioni caricate correttamente.")
+                st.dataframe(parsed_ops.tail(30), use_container_width=True)
+            except Exception as e:
+                st.error(f"Errore nel parsing delle operazioni: {e}")
+
+        if st.button("Salva le operazioni di compravendita", use_container_width=True, key="save_ops"):
+            if parsed_ops is None:
+                st.warning("Caricare prima un file valido.")
+            else:
+                # salviamo come lista di dict (serializzabile)
+                st.session_state["portfolio_operations"][pid] = parsed_ops.to_dict(orient="records")
+                persist_portfolio_operations_from_session()
+                st.success("Operazioni salvate con successo.")
+
+    else:
+        st.info("Funzionalità non attiva nella versione corrente.")
+
+    # ricarico operazioni salvate (se ci sono)
+    df_ops = st.session_state.get("portfolio_operations", {}).get(pid, None)
+    df_ops = pd.DataFrame(df_ops) if isinstance(df_ops, (list, dict)) else df_ops
+    if not (isinstance(df_ops, pd.DataFrame) and not df_ops.empty):
+        st.warning("Caricare e salvare le operazioni per abilitare le analisi di monitoraggio.")
+        return
+    if "date" in df_ops.columns:
+        df_ops["date"] = pd.to_datetime(df_ops["date"]).dt.tz_localize(None)
+
+    # definizione inizio monitoraggio
+    start_date = pd.to_datetime(df_ops["date"]).min().to_pydatetime()
+    st.caption(f"Inizio monitoraggio (prima operazione): {start_date.strftime('%d/%m/%Y')}")
+
+    # -------------------------
+    # (e) Analisi Monitoraggio
+    # -------------------------
+    st.markdown('<div class="uw-card"><h3>Analisi Piano Investimenti</h3></div>', unsafe_allow_html=True)
+
+    cf_actual = _ops_to_cashflows(df_ops)
+    cf_plan2 = _planned_cashflows_monthly(payload, start_date)
+
+    # allineo range
+    idx = cf_plan2.index.union(cf_actual.index)
+    cf_plan2 = cf_plan2.reindex(idx).fillna(0.0)
+    cf_actual = cf_actual.reindex(idx).fillna(0.0)
+    diff = cf_actual - cf_plan2
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Investimenti netti effettivi (somma)", f"{cf_actual.sum():,.0f} €".replace(",", "."))
+    with c2:
+        st.metric("Flussi pianificati (somma)", f"{cf_plan2.sum():,.0f} €".replace(",", "."))
+    with c3:
+        st.metric("Scostamento complessivo", f"{diff.sum():,.0f} €".replace(",", "."))
+
+    df_flow = pd.DataFrame({
+        "Periodo": idx.strftime("%Y-%m"),
+        "Effettivo": cf_actual.values,
+        "Pianificato": cf_plan2.values,
+        "Scostamento": diff.values,
+    })
+    fig_flow = go.Figure()
+    fig_flow.add_trace(go.Bar(x=df_flow["Periodo"], y=df_flow["Effettivo"], name="Effettivo"))
+    fig_flow.add_trace(go.Bar(x=df_flow["Periodo"], y=df_flow["Pianificato"], name="Pianificato"))
+    fig_flow.update_layout(barmode="group", height=360, xaxis_tickangle=-45, yaxis_title="€")
+    st.plotly_chart(fig_flow, use_container_width=True)
+
+    st.markdown('<div class="uw-card"><h3>Analisi Composizione Portafoglio</h3></div>', unsafe_allow_html=True)
+
+    holdings, total_val = _compute_holdings_and_values(df_ops)
+    holdings = _map_products_to_asset_class(holdings)
+
+    if total_val <= 0:
+        st.warning("Non risulta un portafoglio investito (valore corrente nullo).")
+        return
+
+    # composizione corrente per asset class
+    h2 = holdings.copy()
+    h2["asset_class"] = h2["asset_class"].replace({"": "Non classificato"}).fillna("Non classificato")
+    by_ac = h2.groupby("asset_class")["value"].sum().sort_values(ascending=False)
+    w_cur = (by_ac / by_ac.sum()).to_dict()
+
+    # peso target al tempo t (anni trascorsi dall'inizio)
+    years_elapsed = int(max(0, math.floor((datetime.now() - start_date).days / 365.25)))
+    comp_df = _get_portfolio_target_weights_over_years(payload)
+    asset_cols = [c for c in comp_df.columns if c != "year"]
+    row_t = comp_df[comp_df["year"] <= years_elapsed].tail(1)
+    if len(row_t) == 0:
+        w_t = {a: 0.0 for a in asset_cols}
+    else:
+        w_t = row_t[asset_cols].iloc[0].to_dict()
+        s = float(sum(w_t.values()))
+        if s > 0:
+            w_t = {k: float(v)/s for k,v in w_t.items()}
+
+    # dataframe confronto
+    all_ac = sorted(set(list(w_t.keys()) + list(w_cur.keys())))
+    df_comp = pd.DataFrame({
+        "Asset Class": all_ac,
+        "Target (AA dinamica)": [float(w_t.get(a, 0.0) or 0.0) for a in all_ac],
+        "Corrente (prodotti)": [float(w_cur.get(a, 0.0) or 0.0) for a in all_ac],
+    })
+    df_comp["Delta"] = df_comp["Corrente (prodotti)"] - df_comp["Target (AA dinamica)"]
+
+    st.caption(f"Confronto effettuato con Asset Allocation prevista dopo {years_elapsed} anni.")
+    fig_comp = go.Figure()
+    fig_comp.add_trace(go.Bar(x=df_comp["Asset Class"], y=df_comp["Target (AA dinamica)"], name="Target"))
+    fig_comp.add_trace(go.Bar(x=df_comp["Asset Class"], y=df_comp["Corrente (prodotti)"], name="Corrente"))
+    fig_comp.update_layout(barmode="group", height=380, yaxis_tickformat=".0%")
+    st.plotly_chart(fig_comp, use_container_width=True)
+    st.dataframe(df_comp.sort_values("Delta", key=lambda s: s.abs(), ascending=False), use_container_width=True)
+
+    st.markdown('<div class="uw-card"><h3>Performance Money Weighted</h3></div>', unsafe_allow_html=True)
+
+    # costruisco cashflow per XIRR: BUY (out), SELL (in), e finale valore (in) oggi
+    cashflows = []
+    for _, r in df_ops.sort_values("date").iterrows():
+        d = pd.to_datetime(r["date"]).to_pydatetime()
+        amt = float(r["qty"] * r["price"] + r["fees"])
+        if r["side"] == "BUY":
+            cashflows.append((d, -abs(amt)))
+        else:
+            cashflows.append((d, abs(max(0.0, r["qty"] * r["price"] - r["fees"]))))
+    cashflows.append((datetime.now(), float(total_val)))
+
+    irr = _xirr(cashflows, guess=0.05)
+    if irr is None:
+        st.info("Money Weighted Return (XIRR): non calcolabile (flussi non idonei o mancata convergenza).")
+    else:
+        st.metric("Money Weighted Return (XIRR)", f"{irr*100:.2f}%")
+
+    # serie valore (stepwise) su mesi
+    idx_val = pd.date_range(start=pd.Timestamp(start_date).replace(day=1), end=pd.Timestamp(datetime.now()).replace(day=1), freq="MS")
+    # approssimazione: valore corrente costante retroattivamente non disponibile; mostriamo montante cumulato dei flussi come proxy e valore finale reale.
+    cum_flows = (-_ops_to_cashflows(df_ops)).reindex(idx_val).fillna(0.0).cumsum()
+    val_series = cum_flows.copy()
+    val_series.iloc[-1] = total_val
+
+    df_val = pd.DataFrame({"Periodo": idx_val.strftime("%Y-%m"), "Montante effettivo (€)": val_series.values})
+
+    # percorso atteso Montecarlo (mediana) se possibile
+    W_sim, err = _simulate_portfolio_paths(payload, start_date, n_scen=1000, seed=7)
+    if W_sim is None:
+        st.info(f"Percorso atteso Montecarlo non disponibile: {err}")
+        fig_val = go.Figure()
+        fig_val.add_trace(go.Scatter(x=df_val["Periodo"], y=df_val["Montante effettivo (€)"], mode="lines+markers", name="Effettivo"))
+        fig_val.update_layout(height=380, yaxis_title="€", xaxis_tickangle=-45)
+        st.plotly_chart(fig_val, use_container_width=True)
+        W_final_for_next = float(total_val)
+    else:
+        # statistiche (allineo in mesi)
+        p50 = np.percentile(W_sim, 50, axis=0)
+        p10 = np.percentile(W_sim, 10, axis=0)
+        p90 = np.percentile(W_sim, 90, axis=0)
+        periods = pd.date_range(start=pd.Timestamp(start_date).replace(day=1), periods=W_sim.shape[1], freq="MS")
+        df_mc = pd.DataFrame({
+            "Periodo": periods.strftime("%Y-%m"),
+            "Atteso (50p)": p50,
+            "Pessimistico (10p)": p10,
+            "Ottimistico (90p)": p90,
+        })
+        # unisco su asse comune
+        fig_val = go.Figure()
+        fig_val.add_trace(go.Scatter(x=df_val["Periodo"], y=df_val["Montante effettivo (€)"], mode="lines+markers", name="Effettivo"))
+        fig_val.add_trace(go.Scatter(x=df_mc["Periodo"], y=df_mc["Atteso (50p)"], mode="lines", name="Atteso (50p)"))
+        fig_val.add_trace(go.Scatter(x=df_mc["Periodo"], y=df_mc["Pessimistico (10p)"], mode="lines", name="Pessimistico (10p)"))
+        fig_val.add_trace(go.Scatter(x=df_mc["Periodo"], y=df_mc["Ottimistico (90p)"], mode="lines", name="Ottimistico (90p)"))
+        fig_val.update_layout(height=420, yaxis_title="€", xaxis_tickangle=-45)
+        st.plotly_chart(fig_val, use_container_width=True)
+        W_final_for_next = float(val_series.iloc[-1])
+
+    # -------------------------
+    # Sezioni solo GBI
+    # -------------------------
+    if bool(payload.get("gbi", False)):
+        st.markdown('<div class="uw-card"><h3>Stima Probabilità di Successo</h3></div>', unsafe_allow_html=True)
+
+        # probabilità iniziale (salvata)
+        p0 = float(payload.get("gbi_best_success_prob", np.nan) or np.nan)
+
+        # ricalcolo: uso montecarlo da oggi a fine orizzonte con flussi residui
+        # costruiamo un payload "residuo" con initial_amount pari a montante corrente e periodic/spese residue.
+        horizon_years = int(payload.get("horizon_years", 0) or 0)
+        years_elapsed = int(max(0, math.floor((datetime.now() - start_date).days / 365.25)))
+        months_elapsed = years_elapsed * 12
+
+        # obiettivi residui
+        objectives_all = payload.get("gbi_objectives", []) or []
+        obj_res = []
+        for o in objectives_all:
+            mo = int(o.get("month", o.get("m", 0)) or 0)
+            amt = float(o.get("amount", o.get("amt", 0.0)) or 0.0)
+            if mo > months_elapsed:
+                obj_res.append({"month": int(mo - months_elapsed), "amount": float(amt)})
+
+        # conferimenti residui (riduciamo periodic_years)
+        per_years = int(payload.get("periodic_years", 0) or 0)
+        per_years_res = max(0, per_years - years_elapsed)
+
+        payload_res = dict(payload)
+        payload_res["initial_amount"] = float(W_final_for_next)
+        payload_res["periodic_years"] = int(per_years_res)
+        payload_res["gbi_objectives"] = obj_res
+
+        W_sim2, err2 = _simulate_portfolio_paths(payload_res, datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0), n_scen=1000, seed=11)
+        if W_sim2 is None:
+            st.info(f"Stima non disponibile: {err2}")
+        else:
+            # verifica successo su obiettivi residui: a ciascun mese target la ricchezza deve essere >= amount
+            successes = 0
+            for s in range(W_sim2.shape[0]):
+                if _check_objectives_success(W_sim2[s,:], obj_res):
+                    successes += 1
+            p_now = successes / W_sim2.shape[0] if W_sim2.shape[0] else 0.0
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if np.isfinite(p0):
+                    st.metric("Probabilità di successo iniziale", f"{p0*100:.1f}%")
+                else:
+                    st.metric("Probabilità di successo iniziale", "n.d.")
+            with c2:
+                st.metric("Probabilità di successo attuale (residuo)", f"{p_now*100:.1f}%")
+
+        
+        st.markdown('<div class="uw-card"><h3>Riformula il Portafoglio GBI</h3></div>', unsafe_allow_html=True)
+
+        st.caption("La riformulazione utilizza la stessa logica Monte Carlo + Algoritmo Genetico della sezione Goal-Based Investing, "
+                   "ma parte dal montante corrente e dai flussi/obiettivi residui (tempo già trascorso incorporato).")
+
+        # --- Parametri residui (prefill) ---
+        horizon_years_tot = int(payload.get("horizon_years", 0) or 0)
+        years_elapsed = int(max(0, math.floor((datetime.now() - start_date).days / 365.25)))
+        horizon_years_res = max(1, int(horizon_years_tot - years_elapsed))
+
+        cA, cB, cC = st.columns([0.34, 0.33, 0.33], gap="small")
+        with cA:
+            mon_initial = st.number_input(
+                "Conferimento iniziale di partenza (€)",
+                min_value=0.0,
+                value=float(W_final_for_next),
+                step=1000.0,
+                key="mon_gbi_initial"
+            )
+        with cB:
+            mon_periodic_amt = st.number_input(
+                "Versamento periodico residuo (€)",
+                min_value=0.0,
+                value=float(payload.get("periodic_amount", 0.0) or 0.0),
+                step=100.0,
+                key="mon_gbi_periodic_amt"
+            )
+        with cC:
+            mon_freq = st.selectbox(
+                "Frequenza versamento residuo",
+                ["Mensile", "Trimestrale", "Semestrale", "Annuale"],
+                index=["Mensile","Trimestrale","Semestrale","Annuale"].index(str(payload.get("periodic_freq","Mensile")) if str(payload.get("periodic_freq","Mensile")) in ["Mensile","Trimestrale","Semestrale","Annuale"] else "Mensile"),
+                key="mon_gbi_freq"
+            )
+
+        per_years_tot = int(payload.get("periodic_years", 0) or 0)
+        per_years_res = max(0, int(per_years_tot - years_elapsed))
+        mon_periodic_years = st.number_input(
+            "Anni residui di versamenti periodici",
+            min_value=0,
+            max_value=int(horizon_years_res),
+            value=int(min(per_years_res, horizon_years_res)),
+            step=1,
+            key="mon_gbi_periodic_years"
+        )
+
+        st.metric("Orizzonte residuo (anni)", f"{horizon_years_res}")
+
+        # --- Obiettivi residui (prefill e modificabili) ---
+        rows = []
+        objectives_all = payload.get("gbi_objectives", []) or []
+        for ob in objectives_all:
+            goal = str(ob.get("goal", ob.get("name", "Obiettivo"))).strip() or "Obiettivo"
+            pr = int(ob.get("priority", 999999) or 999999)
+            for s in ob.get("schedule", []):
+                try:
+                    y = int(s.get("year", 0) or 0)
+                    amt = float(s.get("amount", 0.0) or 0.0)
+                except Exception:
+                    continue
+                y_res = int(y - years_elapsed)
+                if y_res <= 0 or amt <= 0:
+                    continue
+                rows.append({"Obiettivo": goal, "Priorità": pr, "Anni futuri (residui)": y_res, "Importo (€)": amt})
+
+        if not rows:
+            st.warning("Non risultano obiettivi residui. La riformulazione GBI è disponibile solo se esistono obiettivi futuri.")
+        else:
+            df_obj = pd.DataFrame(rows).sort_values(["Priorità","Anni futuri (residui)","Obiettivo"]).reset_index(drop=True)
+            st.markdown('<div class="uw-sec-title-sm">Obiettivi futuri (residui)</div>', unsafe_allow_html=True)
+            st.caption("È possibile modificare importi, priorità e timing. Gli anni sono già stati ridotti del tempo trascorso.")
+            edited = st.data_editor(
+                df_obj,
+                use_container_width=True,
+                num_rows="dynamic",
+                key="mon_gbi_obj_editor"
+            )
+            edited = pd.DataFrame(edited)
+
+            # ricostruisco objectives_all (struttura compatibile con GBI: lista obiettivi con schedule annuale)
+            obj_rebuilt = []
+            if not edited.empty:
+                edited["Obiettivo"] = edited["Obiettivo"].astype(str).str.strip().replace({"": "Obiettivo"})
+                edited["Priorità"] = pd.to_numeric(edited["Priorità"], errors="coerce").fillna(999999).astype(int)
+                edited["Anni futuri (residui)"] = pd.to_numeric(edited["Anni futuri (residui)"], errors="coerce").fillna(0).astype(int)
+                edited["Importo (€)"] = pd.to_numeric(edited["Importo (€)"], errors="coerce").fillna(0.0).astype(float)
+
+                for (g, pr), grp in edited.groupby(["Obiettivo","Priorità"], dropna=False):
+                    sched = []
+                    for _, rr in grp.iterrows():
+                        y = int(rr["Anni futuri (residui)"])
+                        a = float(rr["Importo (€)"])
+                        if y > 0 and a > 0:
+                            sched.append({"year": y, "amount": a})
+                    if sched:
+                        obj_rebuilt.append({"goal": str(g), "priority": int(pr), "schedule": sched})
+
+            # --- Selezione set / portafogli candidati ---
+            selected_set_name = payload.get("gbi_asset_selection", None)
+            if (not selected_set_name) or (selected_set_name not in st.session_state.get("asset_selections", {})):
+                st.error("Il Set di Asset Allocation associato al portafoglio GBI non è disponibile (Tools → Portafogli in Asset Class).")
+            else:
+                set_payload = st.session_state["asset_selections"][selected_set_name]
+                assets_df = set_payload.get("assets_df", pd.DataFrame(columns=["Asset Class", "Macro-Asset Class"]))
+                alloc_df = set_payload.get("alloc_df", None)
+                exp_ret = set_payload.get("exp_ret", None)
+                vol = set_payload.get("vol", None)
+                corr = set_payload.get("corr", None)
+
+                if alloc_df is None or not isinstance(alloc_df, pd.DataFrame) or alloc_df.empty:
+                    st.error("Il Set associato non contiene composizioni portafogli valide.")
+                else:
+                    st.markdown('<div class="uw-sec-title-sm">Portafogli candidati (per Algoritmo Genetico)</div>', unsafe_allow_html=True)
+                    all_pf_names = alloc_df.index.astype(str).tolist()
+                    default_pf = all_pf_names[:min(10, len(all_pf_names))]
+                    selected_pf = st.multiselect(
+                        "Seleziona i portafogli candidati (max 12)",
+                        options=all_pf_names,
+                        default=st.session_state.get("mon_gbi_selected_pf", default_pf),
+                        max_selections=12,
+                        key="mon_gbi_selected_pf"
+                    )
+                    if len(selected_pf) < 2:
+                        st.warning("Selezionare almeno 2 portafogli candidati.")
+                    else:
+                        # --- costruisco W_ports e ordino per rischio crescente (indice 1 = meno rischioso) ---
+                        asset_names = [c for c in alloc_df.columns.astype(str).tolist()]
+                        W_raw = alloc_df.loc[selected_pf, asset_names].astype(float).values  # (K, A)
+                        # normalizzazione robusta
+                        W_raw = np.clip(W_raw, 0.0, None)
+                        W_sum = np.maximum(W_raw.sum(axis=1, keepdims=True), 1e-12)
+                        W_raw = W_raw / W_sum
+
+                        # cov annua
+                        try:
+                            mu_ann = np.asarray(exp_ret[asset_names], dtype=float).reshape(-1)
+                            sig_ann = np.asarray(vol[asset_names], dtype=float).reshape(-1)
+                            C = np.asarray(corr.loc[asset_names, asset_names], dtype=float)
+                            C = np.clip(C, -1.0, 1.0)
+                            cov_ann = np.outer(sig_ann, sig_ann) * C
+                        except Exception:
+                            st.error("Input di mercato del Set non disponibili (exp_ret/vol/corr).")
+                            cov_ann = None
+
+                        if cov_ann is not None:
+                            port_sig = np.sqrt(np.einsum("ij,jk,ik->i", W_raw, cov_ann, W_raw))
+                            order = np.argsort(port_sig)  # crescente
+                            W_ports = W_raw[order, :]
+                            ports_ordered = [str(selected_pf[i]) for i in order.tolist()]
+                            H = int(W_ports.shape[0])
+
+                            # --- parametri GA / MC ---
+                            c1, c2, c3, c4 = st.columns([0.25, 0.25, 0.25, 0.25], gap="small")
+                            with c1:
+                                n_scen = st.number_input("Numero scenari", min_value=200, max_value=20000, value=1000, step=100, key="mon_gbi_n_scen")
+                            with c2:
+                                seed = st.number_input("Seed", min_value=0, max_value=999999, value=12345, step=1, key="mon_gbi_seed")
+                            with c3:
+                                pop_size = st.number_input("Popolazione", min_value=50, max_value=1000, value=100, step=50, key="mon_gbi_pop")
+                            with c4:
+                                n_gen = st.number_input("Generazioni", min_value=20, max_value=500, value=120, step=10, key="mon_gbi_gen")
+
+                            # --- flussi mensili residui ---
+                            def _build_monthly_contributions(T_years_: int, freq_: str, periodic_amt_: float, periodic_years_: int) -> np.ndarray:
+                                M_ = int(T_years_ * 12)
+                                cash_in = np.zeros(M_, dtype=float)
+                                step = {"Mensile": 1, "Trimestrale": 3, "Semestrale": 6, "Annuale": 12}.get(freq_, 12)
+                                max_m = int(periodic_years_ * 12)
+                                if periodic_amt_ <= 0 or max_m <= 0:
+                                    return cash_in
+                                for m in range(step, min(M_, max_m) + 1, step):
+                                    cash_in[m - 1] += float(periodic_amt_)
+                                return cash_in
+
+                            def _build_monthly_outflows_from_objectives(objectives_: list[dict], max_years_: int) -> np.ndarray:
+                                M_ = int(max_years_ * 12)
+                                cash_out = np.zeros(M_, dtype=float)
+                                for ob in (objectives_ or []):
+                                    for s in ob.get("schedule", []):
+                                        try:
+                                            y = int(s.get("year", 0))
+                                            amt = float(s.get("amount", 0.0))
+                                        except Exception:
+                                            continue
+                                        if y <= 0 or amt <= 0:
+                                            continue
+                                        m = int(y * 12) - 1
+                                        if 0 <= m < M_:
+                                            cash_out[m] += amt
+                                return cash_out
+
+                            T_years = int(horizon_years_res)
+                            M_months = int(T_years * 12)
+                            cash_in = _build_monthly_contributions(T_years, mon_freq, float(mon_periodic_amt), int(mon_periodic_years))
+                            cash_out = _build_monthly_outflows_from_objectives(obj_rebuilt, T_years)
+
+                            # --- simulazione rendimenti mensili asset class ---
+                            mu_month = (1.0 + np.asarray(mu_ann, dtype=float)) ** (1.0 / 12.0) - 1.0
+                            cov_month = np.asarray(cov_ann, dtype=float) / 12.0
+
+                            rng = np.random.default_rng(int(seed))
+                            try:
+                                R_assets = rng.multivariate_normal(mean=mu_month, cov=cov_month, size=(int(n_scen), int(M_months)))
+                            except Exception as e:
+                                st.error(f"Errore nella simulazione multivariata: {e}")
+                                R_assets = None
+
+                            def _repair_nonincreasing(row: np.ndarray) -> np.ndarray:
+                                r = row.copy().astype(int)
+                                r = np.clip(r, 1, H)
+                                for i in range(1, len(r)):
+                                    if r[i] > r[i-1]:
+                                        r[i] = r[i-1]
+                                return r
+
+                            def _init_population(pop: int, years: int) -> np.ndarray:
+                                # campiona indici e impone non-crescenza
+                                raw = rng.integers(1, H + 1, size=(int(pop), int(years)))
+                                out = np.zeros_like(raw)
+                                for i in range(raw.shape[0]):
+                                    out[i] = _repair_nonincreasing(raw[i])
+                                return out
+
+                            def _evaluate_population(pop_mat: np.ndarray) -> np.ndarray:
+                                # fitness = prob(success), success se wealth >=0 sempre dopo applicazione flussi
+                                P = pop_mat.shape[0]
+                                fit = np.zeros(P, dtype=float)
+                                if R_assets is None:
+                                    return fit
+                                for i in range(P):
+                                    row = pop_mat[i].astype(int)
+                                    ok = 0
+                                    for s in range(int(n_scen)):
+                                        wealth = float(mon_initial)
+                                        good = True
+                                        for m in range(M_months):
+                                            y = int(m // 12)  # 0..T-1
+                                            idx_port = int(row[y]) - 1
+                                            w = W_ports[idx_port, :]
+                                            r_p = float(np.dot(w, R_assets[s, m, :]))
+                                            wealth = wealth * (1.0 + r_p) + float(cash_in[m]) - float(cash_out[m])
+                                            if wealth < -1e-9:
+                                                good = False
+                                                break
+                                        if good:
+                                            ok += 1
+                                    fit[i] = ok / float(n_scen)
+                                return fit
+
+                            if st.button("Esegui Algoritmo Genetico (Riformulazione)", type="secondary", use_container_width=True, key="mon_gbi_run_ga"):
+                                if R_assets is None:
+                                    st.stop()
+                                with st.status("Algoritmo Genetico in esecuzione…", expanded=True) as _st:
+                                    pop = _init_population(int(pop_size), int(T_years))
+                                    fit = _evaluate_population(pop)
+                                    best_i = int(np.argmax(fit))
+                                    best_row = pop[best_i].copy()
+                                    best_fit = float(fit[best_i])
+
+                                    pc = 0.70
+                                    pm = 0.30
+                                    for g in range(int(n_gen)):
+                                        # elitismo: mantengo best
+                                        new_pop = [best_row.copy()]
+                                        while len(new_pop) < int(pop_size):
+                                            # selection (tournament semplice)
+                                            a = int(rng.integers(0, pop.shape[0]))
+                                            b = int(rng.integers(0, pop.shape[0]))
+                                            p1 = pop[a] if fit[a] >= fit[b] else pop[b]
+                                            a = int(rng.integers(0, pop.shape[0]))
+                                            b = int(rng.integers(0, pop.shape[0]))
+                                            p2 = pop[a] if fit[a] >= fit[b] else pop[b]
+
+                                            if rng.random() < pc and T_years > 1:
+                                                cut = int(rng.integers(1, int(T_years)))
+                                                c1 = np.concatenate([p1[:cut], p2[cut:]])
+                                                c2 = np.concatenate([p2[:cut], p1[cut:]])
+                                                c1 = _repair_nonincreasing(c1)
+                                                c2 = _repair_nonincreasing(c2)
+                                                new_pop.append(c1)
+                                                if len(new_pop) < int(pop_size):
+                                                    new_pop.append(c2)
+                                            else:
+                                                new_pop.append(p1.copy())
+                                                if len(new_pop) < int(pop_size):
+                                                    new_pop.append(p2.copy())
+
+                                        pop = np.vstack(new_pop[:int(pop_size)])
+                                        # mutation
+                                        for i in range(1, pop.shape[0]):  # non mutare l'elite
+                                            if rng.random() < pm:
+                                                pos = int(rng.integers(0, int(T_years)))
+                                                delta = int(rng.integers(-2, 3))
+                                                if delta == 0:
+                                                    delta = 1
+                                                pop[i, pos] = int(np.clip(pop[i, pos] + delta, 1, H))
+                                                pop[i] = _repair_nonincreasing(pop[i])
+
+                                        fit = _evaluate_population(pop)
+                                        bi = int(np.argmax(fit))
+                                        if float(fit[bi]) > best_fit + 1e-12:
+                                            best_fit = float(fit[bi])
+                                            best_row = pop[bi].copy()
+                                        if (g + 1) % 10 == 0 or g == int(n_gen) - 1:
+                                            _st.write(f"Generazione {g+1}/{int(n_gen)} – best p(success)={best_fit:.2%}")
+
+                                    st.session_state["mon_gbi_ga_best"] = {
+                                        "best_row": best_row.tolist(),
+                                        "best_fit": float(best_fit),
+                                        "ports_ordered": ports_ordered,
+                                        "asset_names": asset_names,
+                                        "W_ports": W_ports.tolist(),
+                                        "T_years": int(T_years),
+                                    }
+                                    _st.update(label="Algoritmo Genetico completato", state="complete", expanded=False)
+                                st.success(f"Riformulazione completata. Probabilità di successo (obiettivi residui): {best_fit:.1%}")
+
+                            # --- Visualizzazione risultato + salvataggio (sostituisce il vecchio portafoglio) ---
+                            res = st.session_state.get("mon_gbi_ga_best", None)
+                            if isinstance(res, dict) and res.get("best_row") is not None:
+                                best_row = np.asarray(res["best_row"], dtype=int)
+                                best_fit = float(res["best_fit"])
+
+                                st.markdown('<div class="uw-sec-title-sm">Risultato riformulazione</div>', unsafe_allow_html=True)
+                                df_line = pd.DataFrame({"Anno": np.arange(1, int(T_years) + 1), "Indice Portafoglio": best_row[:int(T_years)]})
+                                fig_line = px.line(df_line, x="Anno", y="Indice Portafoglio", markers=True)
+                                fig_line.update_traces(line=dict(color="rgba(243,156,18,0.8)", width=3), marker=dict(size=16, color="rgba(243,156,18,0.8)"))
+                                fig_line.update_layout(height=320, yaxis=dict(dtick=1), margin=dict(l=10, r=10, t=30, b=10))
+                                st.plotly_chart(fig_line, use_container_width=True)
+
+                                try:
+                                    idx0 = np.clip(best_row[:int(T_years)] - 1, 0, H - 1)
+                                    W_year = np.asarray(W_ports, dtype=float)[idx0, :]
+                                    df_area = pd.DataFrame(W_year, columns=asset_names)
+                                    df_area["Anno"] = np.arange(1, int(T_years) + 1)
+                                    longA = df_area.melt(id_vars=["Anno"], var_name="Asset Class", value_name="Peso")
+                                    fig_area = px.area(longA, x="Anno", y="Peso", color="Asset Class")
+                                    fig_area.update_layout(height=360, yaxis_tickformat=".0%", xaxis=dict(dtick=1), margin=dict(l=10, r=10, t=30, b=10))
+                                    st.plotly_chart(fig_area, use_container_width=True)
+                                except Exception:
+                                    st.info("Impossibile costruire il grafico ad area della composizione per Asset Class.")
+
+                                if st.button("Salva riformulazione (sostituisce il portafoglio GBI)", type="primary", use_container_width=True, key="mon_gbi_save_reform"):
+                                    # costruisco composition_path (Anno=0..T)
+                                    comp_path_records = []
+                                    try:
+                                        rec0 = {"Anno": 0}
+                                        rec0.update({str(a): float(W_year[0, j]) for j, a in enumerate(asset_names)})
+                                        comp_path_records.append(rec0)
+                                        for t in range(int(T_years)):
+                                            rec = {"Anno": int(t+1)}
+                                            rec.update({str(a): float(W_year[t, j]) for j, a in enumerate(asset_names)})
+                                            comp_path_records.append(rec)
+                                    except Exception:
+                                        comp_path_records = None
+
+                                    payload_new = dict(payload)
+                                    payload_new["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    payload_new["horizon_years"] = int(T_years)
+                                    payload_new["initial_amount"] = float(mon_initial)
+                                    payload_new["periodic_amount"] = float(mon_periodic_amt)
+                                    payload_new["periodic_freq"] = str(mon_freq)
+                                    payload_new["periodic_years"] = int(mon_periodic_years)
+                                    payload_new["gbi_objectives"] = obj_rebuilt
+                                    payload_new["gbi_strategy_best_row"] = list(map(int, best_row.tolist()))
+                                    payload_new["gbi_best_success_prob"] = float(best_fit)
+                                    payload_new["gbi_asset_selection"] = selected_set_name
+                                    # composizione iniziale (Anno 1)
+                                    try:
+                                        w0 = {str(a): float(W_year[0, j]) for j, a in enumerate(asset_names)}
+                                        s0 = float(sum(w0.values()))
+                                        if s0 > 0:
+                                            w0 = {k: v/s0 for k, v in w0.items()}
+                                        payload_new["composition"] = w0
+                                    except Exception:
+                                        pass
+                                    payload_new["composition_path"] = comp_path_records
+
+                                    st.session_state["portfolios"][pid] = payload_new
+                                    persist_portfolios_from_session()
+                                    st.success("Portafoglio GBI aggiornato e salvato. Da questo momento diventa il nuovo benchmark di monitoraggio.")
+
+        st.markdown('<div class="uw-card"><h3>Modifica Selezione Prodotti</h3></div>', unsafe_allow_html=True)
+    st.dataframe(holdings, use_container_width=True)
+
+    st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+    st.markdown('<div class="uw-sec-title-sm">Riallocazione (dettaglio per singolo prodotto)</div>', unsafe_allow_html=True)
+    st.caption("La riallocazione produce ordini BUY/SELL per singolo prodotto, applicando vincoli operativi (lotti/minimi) e costi. "
+               "I vincoli possono essere letti dal Database Prodotti se presenti; in alternativa inserire dei default.")
+
+    c1, c2, c3, c4 = st.columns(4, gap="small")
+    with c1:
+        lot_default = st.number_input("Lotto minimo (default, qty)", min_value=0.000001, value=1.0, step=1.0, key="mon_rl_lot")
+    with c2:
+        min_trade_default = st.number_input("Importo minimo operazione (default, €)", min_value=0.0, value=0.0, step=50.0, key="mon_rl_minv")
+    with c3:
+        comm_fixed_default = st.number_input("Commissione fissa (default, €)", min_value=0.0, value=0.0, step=1.0, key="mon_rl_cfix")
+    with c4:
+        comm_pct_default = st.number_input("Commissione % (default)", min_value=0.0, value=0.0, step=0.05, key="mon_rl_cpct")
+
+    if st.button("Rialloca", use_container_width=True, key="btn_realloca"):
+        pdb = st.session_state.get("product_database", None)
+        pdb_df = pdb.get("df") if isinstance(pdb, dict) else None
+
+        orders_df, diag = _suggest_rebalance_trades_per_product(
+            holdings=holdings,
+            target_weights={a: float(w_t.get(a, 0.0) or 0.0) for a in all_ac},
+            total_value=float(total_val),
+            product_db=pdb_df,
+            lot_size_default=float(lot_default),
+            min_trade_value_default=float(min_trade_default),
+            commission_fixed_default=float(comm_fixed_default),
+            commission_pct_default=float(comm_pct_default),
+        )
+
+        if orders_df is None or orders_df.empty:
+            st.warning("Nessun ordine generato (vincoli troppo stringenti, mancanza prezzi o scostamenti trascurabili).")
+        else:
+            st.markdown('<div class="uw-card"><h4>Ordini suggeriti</h4></div>', unsafe_allow_html=True)
+            df_show = orders_df.copy()
+            # formattazione
+            for col in ["Prezzo", "Qty", "Controvalore (€)", "Costi stimati (€)", "Cash impact (€)"]:
+                if col in df_show.columns:
+                    df_show[col] = pd.to_numeric(df_show[col], errors="coerce").fillna(0.0)
+            st.dataframe(
+                df_show.style.format({
+                    "Prezzo": "{:,.4f}",
+                    "Qty": "{:,.6f}",
+                    "Controvalore (€)": "{:,.0f}",
+                    "Costi stimati (€)": "{:,.0f}",
+                    "Cash impact (€)": "{:,.0f}",
+                }).set_properties(**{"white-space": "nowrap"}),
+                use_container_width=True
+            )
+            rc = float(diag.get("residual_cash_estimate", 0.0) or 0.0)
+            st.metric("Cash residuo stimato (dopo ordini e costi)", f"{rc:,.0f} €".replace(",", "."))
+            st.caption("Nota: gli ordini sono una proposta operativa. Se i prezzi non sono disponibili (righe BUY con prezzo=0), "
+                       "è necessario inserire/aggiornare i prezzi per ottenere quantità coerenti.")
+
 
 # =======================
 
@@ -5060,39 +6434,14 @@ def render_crea_portafoglio():
             labels.append(f"Y{year}-P{within}")
             amounts.append(float(periodic_amount) if p <= periodic_periods else 0.0)
 
-    # --- Grafico conferimenti: barre blu (iniziale+periodiche) + cumulato (verdino chiaro quasi trasparente)
-    cum_amounts = list(np.cumsum(np.array(amounts, dtype=float)))
-
-    fig_contrib = go.Figure()
-
-    # Cumulato (sfondo): verdino chiaro, quasi trasparente
-    fig_contrib.add_trace(go.Bar(
-    x=labels,
-    y=cum_amounts,
-    name="Conferimenti cumulati",
-    marker=dict(color="rgba(120, 200, 120, 0.22)", line=dict(width=0)),
-    width=0.90,
-    hovertemplate="Periodo: %{x}<br>Cumulato: %{y:,.0f} €<extra></extra>",
-    ))
-
-    # Conferimenti per periodo: blu (iniziale e versamenti periodici)
-    fig_contrib.add_trace(go.Bar(
-    x=labels,
-    y=amounts,
-    name="Conferimenti",
-    marker=dict(color="rgba(40, 120, 220, 0.85)", line=dict(width=0)),
-    width=0.55,
-    hovertemplate="Periodo: %{x}<br>Conferimento: %{y:,.0f} €<extra></extra>",
-    ))
-
+    contrib_df = pd.DataFrame({"Periodo": labels, "Conferimenti (€)": amounts})
+    fig_contrib = px.bar(contrib_df, x="Periodo", y="Conferimenti (€)")
+    fig_contrib.update_traces(marker_color="rgba(120, 200, 120, 0.8)")
     fig_contrib.update_layout(
-    barmode="overlay",
-    margin=dict(l=10, r=10, t=30, b=10),
-    xaxis_title="",
-    yaxis_title="€",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_title="",
+        yaxis_title="€"
     )
-
     st.plotly_chart(fig_contrib, use_container_width=True)
 
     # -----------------------
@@ -6251,45 +7600,12 @@ def render_crea_soluzione_gbi():
             amounts.append(float(periodic_amount) if p <= periodic_periods else 0.0)
 
     contrib_df = pd.DataFrame({"Periodo": labels_p, "Conferimenti (€)": amounts})
-
-    # Barre cumulate (iniziale + versamenti periodici)
-    contrib_df["Cumulato (€)"] = contrib_df["Conferimenti (€)"].cumsum()
-
-    # Grafico: cumulato (verdino chiaro, quasi trasparente) come sfondo + conferimenti come barre principali
-    x_vals = contrib_df["Periodo"].astype(str).tolist()
-    y_contrib = contrib_df["Conferimenti (€)"].astype(float).tolist()
-    y_cum = contrib_df["Cumulato (€)"].astype(float).tolist()
-
-    fig_contrib = go.Figure()
-
-    # Cumulato: verdino chiaro, quasi trasparente, barra più larga per essere visibile anche con overlay
-    fig_contrib.add_trace(go.Bar(
-        x=x_vals,
-        y=y_cum,
-        name="Cumulato conferimenti",
-        marker=dict(color="rgba(144, 238, 144, 0.22)", line=dict(width=0)),
-        width=0.88,
-        hovertemplate="%{x}<br>Cumulato: %{y:,.0f} €<extra></extra>",
-    ))
-
-    # Conferimenti: barre principali (iniziale e periodici) più strette, sopra al cumulato
-    fig_contrib.add_trace(go.Bar(
-        x=x_vals,
-        y=y_contrib,
-        name="Conferimenti",
-        marker=dict(color="rgba(31, 119, 180, 0.95)", line=dict(width=0)),
-        width=0.56,
-        hovertemplate="%{x}<br>Conferimento: %{y:,.0f} €<extra></extra>",
-    ))
-
+    fig_contrib = px.bar(contrib_df, x="Periodo", y="Conferimenti (€)")
     fig_contrib.update_layout(
-        barmode="overlay",
         margin=dict(l=10, r=10, t=30, b=10),
         xaxis_title="",
-        yaxis_title="€",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+        yaxis_title="€"
     )
-
     st.plotly_chart(fig_contrib, use_container_width=True)
 
     # -----------------------
@@ -7811,47 +9127,6 @@ def render_crea_soluzione_gbi():
                         
                             xs_g, ys_g = _concat_paths_idx(show_idx)
                             fig_dyn = go.Figure()
-
-                            # ------------------------------------------------------------
-                            # Barre verdine (quasi trasparenti): cumulato conferimenti
-                            # (iniziale + versamenti periodici) come "sfondo" del grafico
-                            # ------------------------------------------------------------
-                            try:
-                                _mult = {"Mensile": 12, "Trimestrale": 4, "Semestrale": 2, "Annuale": 1}.get(freq, 1)
-                                _hY = int(horizon_years)
-                                _pY = int(periodic_years)
-
-                                if freq == "Annuale":
-                                    _t_years = [0.0] + [float(y) for y in range(1, _hY + 1)]
-                                    _flows = [float(initial_amount)] + [
-                                        float(periodic_amount) if y <= _pY else 0.0
-                                        for y in range(1, _hY + 1)
-                                    ]
-                                else:
-                                    _total_p = _hY * _mult
-                                    _periodic_p = _pY * _mult
-                                    _t_years = [0.0]
-                                    _flows = [float(initial_amount)]
-                                    for p in range(1, _total_p + 1):
-                                        _t_years.append(p / float(_mult))
-                                        _flows.append(float(periodic_amount) if p <= _periodic_p else 0.0)
-
-                                _cum = np.cumsum(np.array(_flows, dtype=float)).tolist()
-                                _bar_w = 0.60 / float(_mult)  # larghezza (in anni)
-                            except Exception:
-                                _t_years, _cum, _bar_w = [], [], None
-
-                            if _t_years and _cum:
-                                fig_dyn.add_trace(go.Bar(
-                                    x=_t_years,
-                                    y=_cum,
-                                    name="Cumulato conferimenti",
-                                    yaxis="y2",
-                                    marker=dict(color="rgba(144, 238, 144, 0.22)", line=dict(width=0)),
-                                    width=_bar_w,
-                                    hovertemplate="t=%{x:.2f} anni<br>Cumulato conferimenti: %{y:,.0f} €<extra></extra>",
-                                ))
-
                             fig_dyn.add_trace(go.Scatter(
                                 x=xs_g, y=ys_g,
                                 mode="lines",
@@ -7888,7 +9163,6 @@ def render_crea_soluzione_gbi():
                                 yaxis_title="Montante (€)",
                                 margin=dict(l=10, r=10, t=60, b=10),
                                 yaxis=dict(range=[y_min - pad, y_max + pad], automargin=True, showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False),
-                                yaxis2=dict(overlaying="y", matches="y", visible=False, showgrid=False, zeroline=False),
                                 xaxis=dict(automargin=True, showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False),
                                 hovermode="x unified",
                                 plot_bgcolor="white",
