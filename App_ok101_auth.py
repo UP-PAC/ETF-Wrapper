@@ -39,7 +39,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import time
 import math
@@ -1203,6 +1203,9 @@ NAVBAR_HTML_TEMPLATE = """
             <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Database%20Mercati" target="_self">
               <b>Database Mercati</b><span>Upload rendimenti e controlli qualità</span>
             </a>
+            <a class="uw-dd-item" href="?{auth_qs}main=Tools&tools=Serie%20Storiche%20Prodotti" target="_self">
+              <b>Serie Storiche Prodotti</b><span>Upload prezzi storici (date × ISIN)</span>
+            </a>
           </div>
         </div>
 
@@ -1393,7 +1396,7 @@ def top_nav_controls():
     Ritorna: (main_section, tools_subsection, crea_subsection).
     """
     valid_main = ["Clienti/Investitori", "Crea Soluzione di Investimento", "Selezione Prodotti", "Monitoraggio Portafoglio", "Analisi Asset Allocation", "Tools"]
-    valid_tools = ["Griglie Clientela", "Portafogli in Asset Class", "Database Mercati", "Database Prodotti"]
+    valid_tools = ["Griglie Clientela", "Portafogli in Asset Class", "Database Mercati", "Database Prodotti", "Serie Storiche Prodotti"]
     valid_crea = ["Asset-Only", "Goal-Based Investing"]
 
     # default
@@ -2084,6 +2087,177 @@ def render_database_prodotti():
             st.session_state["product_database"] = None
             _STORAGE.save(_USER_ID, "product_database", None)
             st.success("Database Prodotti rimosso.")
+
+
+def ensure_product_prices_database_storage():
+    """Inizializza e ripristina il Database Prezzi Prodotti (Tools → Serie Storiche Prodotti)."""
+    if "product_prices_database" not in st.session_state:
+        st.session_state["product_prices_database"] = None  # dict: {"df": DataFrame, "saved_at": str}
+    load_persisted_product_prices_database_into_session()
+
+
+def load_persisted_product_prices_database_into_session() -> None:
+    """Carica il Database Prezzi Prodotti (Tools → Serie Storiche Prodotti) da storage per-utente, se mancante in sessione."""
+    if st.session_state.get("product_prices_database") is None:
+        persisted = _STORAGE.load(_USER_ID, "product_prices_database", None)
+        if isinstance(persisted, dict) and isinstance(persisted.get("df"), pd.DataFrame):
+            st.session_state["product_prices_database"] = persisted
+
+
+def persist_product_prices_database_from_session() -> None:
+    payload = st.session_state.get("product_prices_database", None)
+    if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame):
+        _STORAGE.save(_USER_ID, "product_prices_database", payload)
+
+
+def build_product_prices_database_template_excel_bytes() -> bytes:
+    """
+    Template Excel consigliato per il Database Prezzi Prodotti.
+
+    Struttura:
+    - Colonna A: Date
+    - Riga 1: ISIN dei prodotti (es. IE00B4L5Y983)
+    """
+    # Esempio mensile (6 punti)
+    dates = pd.date_range(start=pd.Timestamp.today().normalize() - pd.offsets.MonthBegin(6), periods=6, freq="MS")
+    df = pd.DataFrame(
+        {
+            "Date": dates,
+            "IE00B4L5Y983": [100.0, 101.2, 99.8, 103.4, 104.1, 105.0],
+            "LU1234567890": [50.0, 49.6, 50.8, 51.4, 52.0, 51.7],
+        }
+    )
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Prices")
+    return bio.getvalue()
+
+
+def _normalize_isin(x: str) -> str:
+    s = str(x).strip().upper()
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _read_product_prices_excel(file) -> pd.DataFrame:
+    """Legge il file Excel dei prezzi prodotti."""
+    df = pd.read_excel(file)
+    # rimuove colonne completamente vuote
+    df = df.dropna(axis=1, how="all")
+    # rimuove righe completamente vuote
+    df = df.dropna(axis=0, how="all")
+    return df
+
+
+def _validate_product_prices_df(df: pd.DataFrame) -> tuple[bool, str]:
+    if df is None or df.empty:
+        return False, "Il file caricato è vuoto."
+
+    if df.shape[1] < 2:
+        return False, "Il file deve contenere almeno due colonne: Date e almeno un ISIN."
+
+    # Prima colonna: date
+    date_col = df.columns[0]
+    try:
+        df_dates = pd.to_datetime(df[date_col], errors="coerce")
+    except Exception:
+        return False, "Impossibile interpretare la prima colonna come Date."
+
+    if df_dates.isna().all():
+        return False, "La prima colonna non contiene date valide."
+
+    # Intestazioni ISIN
+    isin_cols = list(df.columns[1:])
+    norm_isins = [_normalize_isin(c) for c in isin_cols]
+    if any((not s) for s in norm_isins):
+        return False, "Alcuni ISIN (intestazioni delle colonne) sono vuoti."
+
+    # Check duplicati
+    if len(set(norm_isins)) != len(norm_isins):
+        return False, "Sono presenti ISIN duplicati nella prima riga (intestazioni)."
+
+    # Numericità prezzi (tolleranza: NaN ammessi)
+    price_block = df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")
+    if price_block.notna().sum().sum() == 0:
+        return False, "Le colonne dei prezzi non contengono valori numerici."
+
+    return True, "OK"
+
+
+def render_serie_storiche_prodotti():
+    """Tools → Serie Storiche Prodotti."""
+    ensure_product_prices_database_storage()
+
+    st.markdown(
+        '<div class="uw-card"><h2>Serie Storiche Prodotti</h2>'
+        "<p>Carichi un file Excel con le serie storiche dei <b>prezzi</b> dei prodotti.</p>"
+        "<ul>"
+        "<li><b>Colonna A</b>: Date</li>"
+        "<li><b>Riga 1</b>: ISIN dei prodotti</li>"
+        "</ul>"
+        "<p>Nota: i prezzi devono essere coerenti (stessa valuta e stessa definizione, ad es. NAV o Close) per confronti corretti.</p>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    # Template download
+    tpl_bytes = build_product_prices_database_template_excel_bytes()
+    st.download_button(
+        "Scarica template Excel (prezzi prodotti)",
+        data=tpl_bytes,
+        file_name="template_prezzi_prodotti.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+
+    st.markdown('<div class="uw-card"><h3>Upload file</h3></div>', unsafe_allow_html=True)
+    up = st.file_uploader(
+        "Carica il file Excel (Date × ISIN)",
+        type=["xlsx", "xls"],
+        key="upload_product_prices_db"
+    )
+
+    if up is not None:
+        try:
+            df = _read_product_prices_excel(up)
+            ok, msg = _validate_product_prices_df(df)
+            if not ok:
+                st.error(msg)
+            else:
+                # normalizza header e date
+                date_col = df.columns[0]
+                df = df.copy()
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                df = df.dropna(subset=[date_col]).sort_values(by=date_col)
+                # normalizza ISIN header
+                new_cols = [str(df.columns[0]).strip()] + [_normalize_isin(c) for c in df.columns[1:]]
+                df.columns = new_cols
+
+                st.success("File valido. Anteprima:")
+                st.dataframe(df.head(20), use_container_width=True)
+                # Salva in bozza (non persistente finché non si preme 'Salva')
+                st.session_state["product_prices_database_candidate"] = {
+                    "df": df,
+                    "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+                st.markdown("---")
+                if st.button("Salva", key="save_product_prices_db", use_container_width=True):
+                    st.session_state["product_prices_database"] = st.session_state.get("product_prices_database_candidate")
+                    persist_product_prices_database_from_session()
+                    st.success("Database dei prezzi prodotti salvato correttamente.")
+
+        except Exception as e:
+            st.error(f"Errore nella lettura del file: {e}")
+
+    # Stato corrente (se presente)
+    payload = st.session_state.get("product_prices_database")
+    if isinstance(payload, dict) and isinstance(payload.get("df"), pd.DataFrame):
+        df_saved = payload["df"]
+        st.markdown('<div class="uw-card"><h3>Database attualmente disponibile</h3></div>', unsafe_allow_html=True)
+        st.write(f"Ultimo salvataggio: **{payload.get('saved_at','-')}**")
+        st.write(f"Righe: **{len(df_saved):,}**  |  Prodotti (ISIN): **{df_saved.shape[1]-1:,}**")
+        st.dataframe(df_saved.tail(10), use_container_width=True)
 
 
 def render_analisi_portafoglio():
@@ -4111,6 +4285,193 @@ def _render_ai_products_from_portfolio(client_key: str, pid: str, payload: dict)
                 _show_categorical(v)
 
 
+
+
+    # =========================
+    # Backtesting
+    # =========================
+    st.markdown("---")
+    st.subheader("Backtesting")
+
+    # Recupero database prezzi prodotti (Tools → Serie Storiche Prodotti)
+    ensure_product_prices_database_storage()
+    pp_payload = st.session_state.get("product_prices_database", None)
+    prices_df = None
+    if isinstance(pp_payload, dict) and isinstance(pp_payload.get("df"), pd.DataFrame):
+        prices_df = pp_payload.get("df").copy()
+
+    if prices_df is None or prices_df.empty:
+        st.info("Per effettuare il backtesting è necessario caricare il database prezzi in Tools → Serie Storiche Prodotti.")
+    else:
+        # Normalizzazione colonne / date
+        try:
+            if prices_df.columns.size > 0:
+                prices_df = prices_df.copy()
+            # La prima colonna deve essere la data: se è già index datetime va bene
+            if not isinstance(prices_df.index, pd.DatetimeIndex):
+                # Provo a usare la prima colonna come data
+                first_col = prices_df.columns[0]
+                dt = pd.to_datetime(prices_df[first_col], errors="coerce")
+                prices_df = prices_df.drop(columns=[first_col])
+                prices_df.index = dt
+            prices_df = prices_df.sort_index()
+            prices_df = prices_df[~prices_df.index.isna()]
+        except Exception:
+            st.warning("Database prezzi non interpretabile: verificare che la prima colonna contenga le date e la prima riga gli ISIN.")
+            prices_df = None
+
+    if prices_df is not None and not prices_df.empty:
+        # ISIN selezionati
+        sel_isins = []
+        if isinstance(_df_prod, pd.DataFrame) and len(_df_prod) > 0:
+            if "ISIN" in _df_prod.columns:
+                sel_isins = [str(x) for x in _df_prod["ISIN"].tolist() if str(x).strip() != ""]
+
+        if not sel_isins:
+            st.info("Selezionare almeno un prodotto per effettuare il backtesting.")
+        else:
+            # Limito alle colonne disponibili
+            available_cols = [c for c in prices_df.columns if str(c) in set(sel_isins)]
+            missing_cols = [c for c in sel_isins if c not in set([str(x) for x in prices_df.columns])]
+
+            if not available_cols:
+                st.warning("Nessuno degli ISIN selezionati è presente nel database prezzi.")
+            else:
+                max_dt = prices_df.index.max()
+                default_end = max_dt.date() if pd.notna(max_dt) else datetime.today().date()
+                default_start = (default_end - timedelta(days=365*5))
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    bt_start = st.date_input("Data iniziale", value=default_start, key=f"bt_start_{pid}")
+                with c2:
+                    bt_end = st.date_input("Data finale", value=default_end, key=f"bt_end_{pid}")
+
+                if bt_end < bt_start:
+                    st.error("La Data finale deve essere successiva alla Data iniziale.")
+                else:
+                    # Slice periodo
+                    _p = prices_df.loc[(prices_df.index.date >= bt_start) & (prices_df.index.date <= bt_end), available_cols].copy()
+                    # Elimino colonne totalmente NA
+                    _p = _p.dropna(axis=1, how="all")
+
+                    if _p.empty or _p.shape[0] < 2:
+                        st.warning("Nel periodo selezionato non sono disponibili dati sufficienti per il backtesting.")
+                    else:
+                        # Forward-fill limitato (per gestire piccoli buchi); poi richiedo un primo valore valido
+                        _p = _p.apply(pd.to_numeric, errors="coerce")
+                        _p = _p.sort_index().ffill()
+
+                        # Serie base 100 per ciascun prodotto (solo se ha un primo valore valido)
+                        base100 = {}
+                        valid_isins = []
+                        for c in _p.columns:
+                            s = _p[c].dropna()
+                            if s.empty:
+                                continue
+                            first = float(s.iloc[0])
+                            if first == 0:
+                                continue
+                            base100[c] = (_p[c] / first) * 100.0
+                            valid_isins.append(c)
+
+                        if not base100:
+                            st.warning("Nessuna serie storica valida nel periodo selezionato.")
+                        else:
+                            df_b100 = pd.DataFrame(base100)
+
+                            # Portfolio base 100: mostro solo se TUTTI i prodotti selezionati hanno dati nel periodo
+                            show_portfolio = True
+                            # Regola richiesta: se un prodotto selezionato non ha valori per il periodo prescelto, NON mostrare il portafoglio
+                            # (indipendentemente dal fatto che gli altri li abbiano)
+                            if any((isin not in set(valid_isins)) for isin in sel_isins):
+                                show_portfolio = False
+
+                            # Pesi
+                            w_map = {}
+                            if isinstance(_df_prod, pd.DataFrame) and len(_df_prod) > 0:
+                                wcol = None
+                                for cand in ["Peso", "peso", "Weight", "weight", "PESO"]:
+                                    if cand in _df_prod.columns:
+                                        wcol = cand
+                                        break
+                                if wcol is not None and "ISIN" in _df_prod.columns:
+                                    for _, r in _df_prod.iterrows():
+                                        try:
+                                            w_map[str(r["ISIN"])]=float(r.get(wcol,0.0) or 0.0)
+                                        except Exception:
+                                            w_map[str(r["ISIN"])]=0.0
+
+                            # Default: equal weight sui prodotti validi
+                            if not w_map:
+                                n=len(valid_isins)
+                                w_map = {c: (1.0/n if n>0 else 0.0) for c in valid_isins}
+
+                            # Normalizzo pesi sui soli validi
+                            w_vec = {c: float(w_map.get(c,0.0) or 0.0) for c in valid_isins}
+                            w_sum = sum(w_vec.values())
+                            if w_sum <= 0:
+                                n=len(valid_isins)
+                                w_vec = {c: (1.0/n if n>0 else 0.0) for c in valid_isins}
+                                w_sum = sum(w_vec.values())
+                            w_vec = {c: v/w_sum for c,v in w_vec.items()}
+
+                            if show_portfolio:
+                                # Portfolio value con pesi fissi (buy&hold su base prezzi)
+                                pv = None
+                                for c,w in w_vec.items():
+                                    s = _p[c].astype(float)
+                                    pv = s*w if pv is None else pv + s*w
+                                pv = pv.dropna()
+                                if not pv.empty:
+                                    pv_b100 = (pv / float(pv.iloc[0])) * 100.0
+                                    df_b100["Portafoglio (prodotti)"] = pv_b100.reindex(df_b100.index)
+
+                            # Grafico
+                            fig = px.line(df_b100, x=df_b100.index, y=df_b100.columns, markers=False)
+                            fig.update_layout(
+                                xaxis_title="Data",
+                                yaxis_title="Montante (base 100)",
+                                legend_title_text="",
+                                margin=dict(l=10, r=10, t=20, b=10),
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                            if missing_cols:
+                                st.caption("ISIN selezionati non presenti nel database prezzi: " + ", ".join(missing_cols))
+
+                            if not show_portfolio:
+                                st.info("Il montante del portafoglio non è mostrato perché almeno un prodotto selezionato non dispone di una serie storica nel periodo scelto.")
+
+                            # Analisi aggiuntive (facoltative)
+                            with st.expander("Analisi aggiuntive (volatilità, drawdown, correlazioni)"):
+                                # rendimenti logaritmici giornalieri (o frequenza disponibile)
+                                rets = df_b100[valid_isins].pct_change().dropna(how="all")
+                                if rets.empty:
+                                    st.info("Dati insufficienti per le statistiche.")
+                                else:
+                                    ann_factor = 252.0
+                                    vol = rets.std()* (ann_factor ** 0.5)
+                                    # max drawdown
+                                    dd = {}
+                                    for c in valid_isins:
+                                        s = df_b100[c].dropna()
+                                        if s.empty:
+                                            continue
+                                        peak = s.cummax()
+                                        draw = (s/peak)-1.0
+                                        dd[c] = float(draw.min())
+                                    stats = pd.DataFrame({
+                                        "Volatilità ann. (stima)": vol,
+                                        "Max Drawdown": pd.Series(dd),
+                                    })
+                                    st.dataframe(stats, use_container_width=True)
+
+                                    if len(valid_isins) >= 2:
+                                        corr = rets[valid_isins].corr()
+                                        fig2 = px.imshow(corr, text_auto=True, aspect="auto")
+                                        fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+                                        st.plotly_chart(fig2, use_container_width=True)
     # --- Salva soluzione prodotti dentro il portafoglio
     if st.button("Salva Soluzione di Prodotti (collegata al portafoglio)", use_container_width=True, key=f"ai_save_{pid}"):
         payload2 = dict(payload)
@@ -4948,25 +5309,913 @@ load_persisted_portfolios_into_session()
 # =======================
 # Sezione → Monitoraggio Portafoglio
 # =======================
+
 def render_monitoraggio_portafoglio():
+    """Sezione: Monitoraggio Portafoglio.
+
+    Implementa:
+    - Selezione Cliente/Investitore e Portafoglio salvato
+    - Visualizzazione: asset allocation dinamica + conferimenti/spese pianificate
+    - Caricamento operazioni (upload Excel) e salvataggio nel portafoglio
+    - Analisi Piano Investimenti (coerenza flussi)
+    - Analisi Composizione Portafoglio (prodotti -> asset class vs target dinamico)
+    - Performance Money Weighted (montante effettivo vs atteso MC, in forma operativa)
+    - (GBI) Stima Probabilità di Successo
+    - (GBI) Riformula Portafoglio GBI (via redirect alla sezione GBI con contesto)
+    - Modifica Selezione Prodotti (riallocazione suggerita)
     """
-    Sezione dedicata al monitoraggio del portafoglio (placeholder UI).
-    Nota: in questa fase non vengono introdotti calcoli nuovi; solo struttura di pagina.
-    """
+    ensure_anagrafica_storage()
+    ensure_portfolio_storage()
+    ensure_product_database_storage()
+    ensure_market_database_storage()
+
     st.markdown(
         '<div class="uw-card"><h2>Monitoraggio Portafoglio</h2>'
-        "<p>Sezione predisposta per le funzionalità di monitoraggio (andamento, scostamenti, alert e reportistica). "
-        "Contenuti in sviluppo.</p></div>",
+        '<p>Selezioni un cliente e un portafoglio, carichi le operazioni e analizzi coerenza, composizione e performance.</p></div>',
         unsafe_allow_html=True,
     )
 
-# =======================
+    # -----------------------------
+    # Helpers (local)
+    # -----------------------------
+    def _safe_to_datetime(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return None
+        if isinstance(x, (datetime,)):
+            return x
+        try:
+            return pd.to_datetime(x).to_pydatetime()
+        except Exception:
+            return None
 
+    def _normalize_ops_df(df: pd.DataFrame) -> pd.DataFrame:
+        """Standardizza un file operazioni in colonne minime: Date, Tipo, ISIN, Prodotto, Quantita, Prezzo, Importo, Commissioni."""
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame(columns=["Date", "Tipo", "ISIN", "Prodotto", "Quantita", "Prezzo", "Importo", "Commissioni"])
+
+        tmp = df.copy()
+        # normalizza nomi colonna
+        tmp.columns = [str(c).strip() for c in tmp.columns]
+        colmap = {}
+        for c in tmp.columns:
+            cl = c.lower().strip()
+            if cl in ["data", "date", "trade date", "data operazione"]:
+                colmap[c] = "Date"
+            elif cl in ["tipo", "operazione", "operation", "side", "buy/sell", "acquisto/vendita"]:
+                colmap[c] = "Tipo"
+            elif cl in ["isin", "codice isin"]:
+                colmap[c] = "ISIN"
+            elif cl in ["prodotto", "strumento", "security", "nome prodotto", "name"]:
+                colmap[c] = "Prodotto"
+            elif cl in ["quantita", "qty", "quantity", "q.tà"]:
+                colmap[c] = "Quantita"
+            elif cl in ["prezzo", "price", "prezzo unitario"]:
+                colmap[c] = "Prezzo"
+            elif cl in ["importo", "controvalore", "amount", "valore", "cash"]:
+                colmap[c] = "Importo"
+            elif cl in ["commissioni", "fees", "costi", "commissione"]:
+                colmap[c] = "Commissioni"
+
+        tmp = tmp.rename(columns=colmap)
+
+        for c in ["Date", "Tipo", "ISIN", "Prodotto", "Quantita", "Prezzo", "Importo", "Commissioni"]:
+            if c not in tmp.columns:
+                tmp[c] = np.nan
+
+        # date
+        tmp["Date"] = tmp["Date"].apply(_safe_to_datetime)
+        tmp = tmp.dropna(subset=["Date"]).copy()
+
+        # tipo
+        def _norm_tipo(v):
+            s = str(v).strip().upper()
+            if s in ["B", "BUY", "ACQUISTO", "ACQ", "ACQUISTA"]:
+                return "BUY"
+            if s in ["S", "SELL", "VENDITA", "VEND", "VENDI"]:
+                return "SELL"
+            return s if s in ["BUY", "SELL"] else "BUY"
+        tmp["Tipo"] = tmp["Tipo"].apply(_norm_tipo)
+
+        # numerici
+        for nc in ["Quantita", "Prezzo", "Importo", "Commissioni"]:
+            tmp[nc] = pd.to_numeric(tmp[nc], errors="coerce").fillna(0.0)
+
+        # se Importo è mancante, prova a ricostruire
+        miss = tmp["Importo"].abs() < 1e-12
+        if miss.any():
+            tmp.loc[miss, "Importo"] = (tmp.loc[miss, "Quantita"] * tmp.loc[miss, "Prezzo"]).astype(float)
+
+        # importo lordo (commissioni a parte)
+        tmp["Importo"] = tmp["Importo"].astype(float)
+        tmp["Commissioni"] = tmp["Commissioni"].astype(float)
+
+        tmp = tmp.sort_values("Date").reset_index(drop=True)
+        return tmp[["Date", "Tipo", "ISIN", "Prodotto", "Quantita", "Prezzo", "Importo", "Commissioni"]]
+
+    def _build_ops_template_bytes() -> bytes:
+        tpl = pd.DataFrame(
+            [
+                {"Date": "2024-01-01", "Tipo": "BUY", "ISIN": "IT0000000001", "Prodotto": "Esempio ETF", "Quantita": 10, "Prezzo": 100, "Importo": 1000, "Commissioni": 1.5},
+                {"Date": "2024-06-01", "Tipo": "BUY", "ISIN": "IT0000000001", "Prodotto": "Esempio ETF", "Quantita": 5, "Prezzo": 110, "Importo": 550, "Commissioni": 1.5},
+                {"Date": "2025-01-15", "Tipo": "SELL", "ISIN": "IT0000000001", "Prodotto": "Esempio ETF", "Quantita": 3, "Prezzo": 120, "Importo": 360, "Commissioni": 1.5},
+            ]
+        )
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            tpl.to_excel(writer, index=False, sheet_name="Operazioni")
+        return out.getvalue()
+
+    def _lookup_asset_class(isin: str, name: str) -> str:
+        db = st.session_state.get("product_database", None)
+        if not isinstance(db, dict) or not isinstance(db.get("df"), pd.DataFrame) or db["df"].empty:
+            return ""
+        dfp = db["df"].copy()
+        cols = [str(c) for c in dfp.columns]
+        # individua colonna asset class
+        ac_col = None
+        for c in cols:
+            cl = c.lower().strip()
+            if cl in ["asset class", "asset_class", "assetclass", "mercato", "market", "mercato/asset class"]:
+                ac_col = c
+                break
+        # individua colonne identificative
+        isin_col = None
+        name_col = None
+        for c in cols:
+            cl = c.lower().strip()
+            if cl == "isin":
+                isin_col = c
+            if cl in ["prodotto", "nome prodotto", "product", "name", "strumento"]:
+                name_col = c
+        if ac_col is None:
+            return ""
+        # lookup per ISIN
+        if isin_col is not None and isinstance(isin, str) and isin.strip():
+            hit = dfp[dfp[isin_col].astype(str).str.upper().str.strip() == isin.upper().strip()]
+            if len(hit) > 0:
+                v = hit.iloc[0][ac_col]
+                return str(v).strip()
+        # fallback per nome (contains)
+        if name_col is not None and isinstance(name, str) and name.strip():
+            s = name.strip().lower()
+            hit = dfp[dfp[name_col].astype(str).str.lower().str.contains(re.escape(s), na=False)]
+            if len(hit) > 0:
+                v = hit.iloc[0][ac_col]
+                return str(v).strip()
+        return ""
+
+    def _planned_cashflows_yearly(payload: dict) -> pd.DataFrame:
+        """Ritorna tabella Anno, Conferimenti(negativi), Spese(positive) per la durata dell'orizzonte."""
+        T = int(payload.get("horizon_years", 0) or 0)
+        T = max(1, T)
+        initial_amount = float(payload.get("initial_amount", 0.0) or 0.0)
+        periodic_amount = float(payload.get("periodic_amount", 0.0) or 0.0)
+        periodic_years = int(payload.get("periodic_years", 0) or 0)
+        freq = str(payload.get("periodic_freq", "Annuale") or "Annuale")
+
+        years = list(range(0, T + 1))
+        contrib = np.zeros(len(years), dtype=float)
+        expenses = np.zeros(len(years), dtype=float)
+
+        # conferimento iniziale: Anno 0
+        contrib[0] -= abs(initial_amount)
+
+        # periodici: dal primo anno in poi
+        per_year = 0.0
+        if periodic_amount != 0.0:
+            if freq.lower().startswith("mens"):
+                per_year = periodic_amount * 12.0
+            elif freq.lower().startswith("trim"):
+                per_year = periodic_amount * 4.0
+            elif freq.lower().startswith("sem"):
+                per_year = periodic_amount * 2.0
+            else:
+                per_year = periodic_amount * 1.0
+
+            for y in range(1, min(T, periodic_years) + 1):
+                contrib[y] -= abs(per_year)
+
+        # spese (GBI): somma per anno
+        if bool(payload.get("gbi", False)) and isinstance(payload.get("gbi_objectives"), list):
+            for ob in payload.get("gbi_objectives", []):
+                for s in ob.get("schedule", []) or []:
+                    try:
+                        y = int(s.get("year", 0))
+                        a = float(s.get("amount", 0.0))
+                    except Exception:
+                        continue
+                    if y <= 0 or a <= 0:
+                        continue
+                    if 0 <= y <= T:
+                        expenses[years.index(y)] += a
+
+        return pd.DataFrame({"Anno": years, "Conferimenti": contrib, "Spese": expenses})
+
+    def _composition_path_df(payload: dict) -> pd.DataFrame:
+        cp = payload.get("composition_path", None)
+        if isinstance(cp, list) and len(cp) > 0:
+            df = pd.DataFrame(cp).copy()
+            # garantisci colonna Anno
+            if "Anno" not in df.columns:
+                # prova alternative
+                for c in df.columns:
+                    if str(c).lower().strip() in ["anno", "year", "t"]:
+                        df = df.rename(columns={c: "Anno"})
+                        break
+            if "Anno" not in df.columns:
+                df.insert(0, "Anno", list(range(len(df))))
+            df["Anno"] = pd.to_numeric(df["Anno"], errors="coerce").fillna(0).astype(int)
+            # normalizza pesi
+            asset_cols = [c for c in df.columns if c != "Anno"]
+            if asset_cols:
+                S = df[asset_cols].sum(axis=1).replace(0, np.nan)
+                df[asset_cols] = df[asset_cols].div(S, axis=0).fillna(0.0)
+            return df.sort_values("Anno").reset_index(drop=True)
+        # fallback: composizione statica
+        comp = payload.get("composition", {}) if isinstance(payload.get("composition", {}), dict) else {}
+        if comp:
+            row0 = {"Anno": 0, **{str(k): float(v) for k, v in comp.items()}}
+            df = pd.DataFrame([row0])
+            asset_cols = [c for c in df.columns if c != "Anno"]
+            S = df[asset_cols].sum(axis=1).replace(0, np.nan)
+            df[asset_cols] = df[asset_cols].div(S, axis=0).fillna(0.0)
+            return df
+        return pd.DataFrame({"Anno": [0], "Liquidità": [1.0]})
+
+    def _elapsed_years_from_ops(df_ops: pd.DataFrame) -> int:
+        if df_ops is None or df_ops.empty:
+            return 0
+        d0 = df_ops["Date"].min()
+        d1 = datetime.now()
+        try:
+            dy = (d1 - d0).days
+            return max(0, int(dy // 365))
+        except Exception:
+            return 0
+
+    # -----------------------------
+    # A) Seleziona Cliente
+    # -----------------------------
+    anags = st.session_state.get("anagrafiche", {})
+    if not anags:
+        st.warning("Devi prima creare almeno un Cliente/Investitore nella sezione 'Clienti/Investitori'.")
+        return
+
+    client_keys = list(anags.keys())
+    client_labels = []
+    for k in client_keys:
+        d = anags[k].get("data", {})
+        client_labels.append(f'{d.get("nome","").strip()} {d.get("cognome","").strip()}  —  ({k})')
+
+    sel_client_label = st.selectbox("Seleziona Cliente / Investitore", client_labels, key="mon_client_sel")
+    client_key = client_keys[client_labels.index(sel_client_label)]
+
+    # -----------------------------
+    # B) Seleziona Portafoglio salvato
+    # -----------------------------
+    pf = st.session_state.get("portfolios", {}) or {}
+    pf_items = [(pid, payload) for pid, payload in pf.items() if isinstance(payload, dict) and payload.get("client_key") == client_key]
+    if not pf_items:
+        st.info("Nessun portafoglio salvato per il cliente selezionato.")
+        return
+
+    pf_labels = []
+    for pid, payload in pf_items:
+        nm = payload.get("portfolio_name", pid)
+        obj = payload.get("objective", "")
+        gbi_tag = "GBI" if bool(payload.get("gbi", False)) else "Asset-Only"
+        pf_labels.append(f"{nm}  —  {gbi_tag}  —  ID: {pid}")
+
+    sel_pf_label = st.selectbox("Seleziona Portafoglio salvato", pf_labels, key="mon_pf_sel")
+    pid = pf_items[pf_labels.index(sel_pf_label)][0]
+    payload = pf[pid]
+
+    # -----------------------------
+    # C) Grafici: AA dinamica + conferimenti/spese
+    # -----------------------------
+    st.markdown('<div class="uw-card"><h3>Struttura ex‑ante (benchmark del monitoraggio)</h3></div>', unsafe_allow_html=True)
+
+    comp_df = _composition_path_df(payload)
+    asset_cols = [c for c in comp_df.columns if c != "Anno"]
+
+    col1, col2 = st.columns([0.55, 0.45], gap="large")
+
+    with col1:
+        st.markdown("#### Evoluzione dinamica dell’Asset Allocation")
+        area_df = comp_df.copy()
+        # area chart
+        fig = go.Figure()
+        for a in asset_cols:
+            fig.add_trace(go.Scatter(
+                x=area_df["Anno"],
+                y=area_df[a],
+                mode="lines",
+                stackgroup="one",
+                name=str(a),
+                hovertemplate="%{x} anni<br>%{y:.1%}<extra></extra>"
+            ))
+        fig.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=20, b=10),
+            yaxis=dict(tickformat=".0%", range=[0, 1]),
+            xaxis_title="Anni",
+            yaxis_title="Peso",
+            legend_title="Asset Class",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("#### Conferimenti e Spese pianificate")
+        cf = _planned_cashflows_yearly(payload)
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(x=cf["Anno"], y=cf["Conferimenti"], name="Conferimenti (−)", hovertemplate="%{x} anni<br>%{y:,.0f}€<extra></extra>"))
+        if (cf["Spese"].abs().sum() > 0):
+            fig2.add_trace(go.Bar(x=cf["Anno"], y=cf["Spese"], name="Spese (＋)", hovertemplate="%{x} anni<br>%{y:,.0f}€<extra></extra>"))
+        fig2.update_layout(
+            barmode="overlay",
+            height=420,
+            margin=dict(l=10, r=10, t=20, b=10),
+            xaxis_title="Anni",
+            yaxis_title="Flussi (€/anno)",
+            legend_title="Legenda",
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # -----------------------------
+    # D) Carica il portafoglio (operazioni)
+    # -----------------------------
+    st.markdown('<div class="uw-card"><h3>Carica il portafoglio</h3></div>', unsafe_allow_html=True)
+
+    op_mode = st.radio(
+        "Modalità di caricamento",
+        ["Carica le operazioni con file excel", "Aggiungi il portfolio automaticamente (inattivo)"],
+        horizontal=True,
+        key="mon_load_mode"
+    )
+
+    ops_saved = payload.get("monitor_ops", None)
+    ops_df_saved = pd.DataFrame(ops_saved) if isinstance(ops_saved, list) and len(ops_saved) > 0 else pd.DataFrame()
+
+    if op_mode.startswith("Carica le operazioni"):
+        st.markdown("Carichi un file Excel con le operazioni di compravendita. Il template consigliato è disponibile qui sotto.")
+        tpl_bytes = _build_ops_template_bytes()
+        st.download_button(
+            "Scarica template Excel (operazioni)",
+            data=tpl_bytes,
+            file_name="template_operazioni.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+        up = st.file_uploader("Upload operazioni (Excel)", type=["xlsx"], key="mon_ops_upload")
+        uploaded_df = None
+        if up is not None:
+            try:
+                uploaded_df = pd.read_excel(up, sheet_name=0)
+            except Exception as e:
+                st.error(f"Impossibile leggere il file: {e}")
+                uploaded_df = None
+
+        if uploaded_df is not None and isinstance(uploaded_df, pd.DataFrame) and not uploaded_df.empty:
+            norm_df = _normalize_ops_df(uploaded_df)
+            st.markdown("**Anteprima operazioni normalizzate**")
+            st.dataframe(norm_df, use_container_width=True, hide_index=True)
+
+            if st.button("Salva le operazioni di compravendita", use_container_width=True, key="mon_ops_save"):
+                payload2 = dict(payload)
+                payload2["monitor_ops"] = norm_df.to_dict(orient="records")
+                payload2["monitor_ops_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["portfolios"][pid] = payload2
+                persist_portfolios_from_session()
+                if is_reform:
+                    st.session_state.pop("gbi_reformulate_context", None)
+                st.success("Operazioni salvate correttamente nel portafoglio.")
+                payload = payload2
+                ops_df_saved = norm_df.copy()
+
+    else:
+        st.info("Funzionalità non attiva nella versione corrente.")
+
+    if ops_df_saved is not None and not ops_df_saved.empty:
+        st.markdown("**Operazioni attualmente salvate**")
+        st.dataframe(ops_df_saved, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Nessuna operazione salvata: le analisi ex‑post saranno disponibili dopo il caricamento.")
+
+    # Se non abbiamo operazioni, fermiamoci qui (le sezioni successive dipendono dai dati ex‑post)
+    if ops_df_saved is None or ops_df_saved.empty:
+        return
+
+    # -----------------------------
+    # E) Monitoraggio
+    # -----------------------------
+    st.markdown('<div class="uw-card"><h3>Monitoraggio</h3></div>', unsafe_allow_html=True)
+
+    # Preparazioni comuni
+    ops_df = ops_df_saved.copy()
+    ops_df["Asset Class"] = [
+        _lookup_asset_class(isin=str(i), name=str(n))
+        for i, n in zip(ops_df["ISIN"].astype(str), ops_df["Prodotto"].astype(str))
+    ]
+
+    start_dt = ops_df["Date"].min()
+    if start_dt is None:
+        st.error("Le operazioni non contengono una data valida.")
+        return
+
+    # asse temporale mensile
+    start_month = pd.Timestamp(start_dt).to_period("M").to_timestamp()
+    end_month = pd.Timestamp(datetime.now()).to_period("M").to_timestamp()
+    months = pd.date_range(start=start_month, end=end_month, freq="MS")
+    if len(months) < 1:
+        months = pd.date_range(start=start_month, periods=1, freq="MS")
+
+    ops_df["Month"] = ops_df["Date"].apply(lambda x: pd.Timestamp(x).to_period("M").to_timestamp())
+
+    # net cashflows per mese (view investor): BUY = outflow (-), SELL = inflow (+)
+    ops_df["Cashflow"] = np.where(ops_df["Tipo"].astype(str).str.upper() == "SELL", 1.0, -1.0) * ops_df["Importo"].astype(float)
+    ops_df["Cashflow"] = ops_df["Cashflow"] - np.where(ops_df["Tipo"].astype(str).str.upper() == "BUY", ops_df["Commissioni"].astype(float), 0.0)
+    ops_df["Cashflow"] = ops_df["Cashflow"] + np.where(ops_df["Tipo"].astype(str).str.upper() == "SELL", -ops_df["Commissioni"].astype(float), 0.0)
+
+    # -----------------------------
+    # 1) Analisi Piano Investimenti
+    # -----------------------------
+    st.markdown("## Analisi Piano Investimenti")
+    st.caption("Verifica di coerenza tra operazioni effettive e struttura ex‑ante (conferimenti/spese). L’inizio del monitoraggio coincide con la prima operazione.")
+
+    # cashflow pianificati (investor view, annuali) -> trasformazione in mensile su base lineare
+    T = int(payload.get("horizon_years", 0) or 1)
+    cf_y = _planned_cashflows_yearly(payload)
+    # converti in mensile: conferimenti e spese sono applicati a inizio anno (mese 1 di ciascun anno)
+    plan_months = pd.date_range(start=start_month, periods=(T*12)+1, freq="MS")
+    plan = pd.DataFrame({"Month": plan_months})
+    plan["Plan_CF"] = 0.0
+
+    # anno k corrisponde a Month index 12*k
+    for _, r in cf_y.iterrows():
+        y = int(r["Anno"])
+        m_idx = 12 * y
+        if 0 <= m_idx < len(plan):
+            plan.loc[m_idx, "Plan_CF"] += float(r["Conferimenti"]) + float(r["Spese"])
+
+    act = ops_df.groupby("Month", as_index=False)["Cashflow"].sum().rename(columns={"Cashflow": "Actual_CF"})
+    merged = plan.merge(act, on="Month", how="left").fillna({"Actual_CF": 0.0})
+
+    merged["Cum_Plan"] = merged["Plan_CF"].cumsum()
+    merged["Cum_Actual"] = merged["Actual_CF"].cumsum()
+    merged["Delta_Cum"] = merged["Cum_Actual"] - merged["Cum_Plan"]
+
+    c1, c2 = st.columns([0.6, 0.4], gap="large")
+    with c1:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=merged["Month"], y=merged["Cum_Plan"], mode="lines", name="Cumulato pianificato"))
+        fig.add_trace(go.Scatter(x=merged["Month"], y=merged["Cum_Actual"], mode="lines", name="Cumulato effettivo"))
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Cumulato (€, segno investitore)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        last = merged.iloc[-1]
+        st.metric("Scostamento cumulato (Effettivo − Pianificato)", f'{last["Delta_Cum"]:,.0f}€'.replace(",", "X").replace(".", ",").replace("X", "."))
+        st.markdown("**Nota operativa**: valore positivo = l’investitore ha disinvestito/rispescato più del previsto (o ha versato meno); valore negativo = ha versato più del previsto.")
+        st.dataframe(merged.tail(12)[["Month", "Plan_CF", "Actual_CF", "Delta_Cum"]], use_container_width=True, hide_index=True)
+
+    # -----------------------------
+    # 2) Analisi Composizione Portafoglio
+    # -----------------------------
+    st.markdown("## Analisi Composizione Portafoglio")
+    st.caption("Confronto tra composizione effettiva (prodotti → asset class) e asset allocation target dinamica al tempo trascorso.")
+
+    # costruisci esposizione per asset class su base flussi netti (proxy)
+    ops_ac = ops_df.copy()
+    ops_ac["Signed"] = np.where(ops_ac["Tipo"].str.upper() == "BUY", 1.0, -1.0) * ops_ac["Importo"].astype(float)
+    ac_values = ops_ac.groupby("Asset Class", as_index=False)["Signed"].sum()
+    ac_values = ac_values[ac_values["Asset Class"].astype(str).str.strip() != ""].copy()
+    ac_values["Value"] = ac_values["Signed"].clip(lower=0.0)  # evita negativi (vendite > acquisti)
+    tot_val = float(ac_values["Value"].sum() or 0.0)
+    if tot_val <= 0:
+        st.warning("Non è stato possibile ricostruire una composizione effettiva significativa (flussi netti non positivi).")
+        ac_values = pd.DataFrame({"Asset Class": ["(non disponibile)"], "Value": [0.0]})
+        tot_val = 0.0
+
+    ac_values["Weight"] = ac_values["Value"] / (tot_val if tot_val > 0 else 1.0)
+
+    # target al tempo X
+    elapsed_years = _elapsed_years_from_ops(ops_df)
+    comp_df2 = comp_df.copy()
+    comp_df2 = comp_df2.sort_values("Anno")
+    # scegli riga target: min(Anno >= elapsed), altrimenti ultima
+    if (comp_df2["Anno"] >= elapsed_years).any():
+        target_row = comp_df2[comp_df2["Anno"] >= elapsed_years].iloc[0]
+    else:
+        target_row = comp_df2.iloc[-1]
+
+    target = []
+    for a in asset_cols:
+        target.append({"Asset Class": str(a), "Target": float(target_row.get(a, 0.0))})
+    target_df = pd.DataFrame(target)
+    target_df["Target"] = target_df["Target"] / (target_df["Target"].sum() if target_df["Target"].sum() > 0 else 1.0)
+
+    # merge con effettivo
+    comp_cmp = target_df.merge(ac_values[["Asset Class", "Weight", "Value"]], on="Asset Class", how="outer").fillna({"Target": 0.0, "Weight": 0.0, "Value": 0.0})
+    comp_cmp["Gap (Effettivo − Target)"] = comp_cmp["Weight"] - comp_cmp["Target"]
+    comp_cmp = comp_cmp.sort_values("Target", ascending=False)
+
+    colA, colB = st.columns([0.55, 0.45], gap="large")
+    with colA:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=comp_cmp["Asset Class"], y=comp_cmp["Target"], name="Target", hovertemplate="%{x}<br>%{y:.1%}<extra></extra>"))
+        fig.add_trace(go.Bar(x=comp_cmp["Asset Class"], y=comp_cmp["Weight"], name="Effettivo (proxy)", hovertemplate="%{x}<br>%{y:.1%}<extra></extra>"))
+        fig.update_layout(barmode="group", height=360, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Asset Class", yaxis_title="Peso")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with colB:
+        st.markdown(f"**Tempo trascorso dall’inizio investimento:** {elapsed_years} anni")
+        st.dataframe(comp_cmp[["Asset Class", "Target", "Weight", "Gap (Effettivo − Target)"]], use_container_width=True, hide_index=True)
+
+    # -----------------------------
+    # 3) Performance Money Weighted
+    # -----------------------------
+    st.markdown("## Performance Money Weighted")
+    st.caption("Montante effettivo stimato (proxy basata su rendimenti per asset class) confrontato con un percorso atteso (Monte Carlo 1.000 scenari).")
+
+    mdb = st.session_state.get("market_database", None)
+    if not isinstance(mdb, dict) or not isinstance(mdb.get("df"), pd.DataFrame) or mdb["df"].empty:
+        st.warning("Database Mercati non disponibile: impossibile stimare montanti e scenario atteso.")
+        current_wealth = float(tot_val)
+        st.info(f"Montante proxy (senza rendimenti): {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+    else:
+        dfm = mdb["df"].copy()
+        # individua colonna data
+        date_col = None
+        for c in dfm.columns:
+            if str(c).lower().strip() in ["date", "data"]:
+                date_col = c
+                break
+        if date_col is None:
+            st.warning("Database Mercati: colonna data non trovata.")
+            current_wealth = float(tot_val)
+        else:
+            dfm[date_col] = pd.to_datetime(dfm[date_col], errors="coerce")
+            dfm = dfm.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
+            dfm["Month"] = dfm[date_col].dt.to_period("M").dt.to_timestamp()
+
+            # asset class da usare: unione target+effettivo
+            assets_use = sorted(list(set([a for a in asset_cols] + comp_cmp["Asset Class"].astype(str).tolist())))
+            assets_use = [a for a in assets_use if a in dfm.columns]
+            if not assets_use:
+                st.warning("Nessuna asset class del portafoglio è presente nel Database Mercati.")
+                current_wealth = float(tot_val)
+            else:
+                # rendimenti mensili disponibili
+                R = dfm[["Month"] + assets_use].copy()
+                for a in assets_use:
+                    R[a] = pd.to_numeric(R[a], errors="coerce").fillna(0.0).clip(lower=-0.9999)
+
+                # limita finestra a partire dalla prima operazione
+                R = R[R["Month"] >= start_month].copy()
+                if R.empty:
+                    st.warning("Database Mercati: nessuna osservazione dalla data di inizio operazioni.")
+                    current_wealth = float(tot_val)
+                else:
+                    # --- Montante effettivo (proxy): posizioni per asset class, alimentate dai flussi BUY/SELL, poi applico rendimenti.
+                    # Aggrega flussi per mese e asset class: BUY -> +pos, SELL -> -pos (assumo controvalore).
+                    ops_pos = ops_df.copy()
+                    ops_pos["AC"] = ops_pos["Asset Class"].astype(str).replace({"": "(non classificato)"})
+                    ops_pos = ops_pos[ops_pos["AC"] != "(non classificato)"].copy()
+                    ops_pos["PosDelta"] = np.where(ops_pos["Tipo"].str.upper()=="BUY", 1.0, -1.0) * ops_pos["Importo"].astype(float)
+                    pos_delta = ops_pos.groupby(["Month", "AC"], as_index=False)["PosDelta"].sum()
+
+                    # inizializza posizioni a zero
+                    pos = {a: 0.0 for a in assets_use}
+                    wealth_path = []
+                    months_used = R["Month"].tolist()
+                    for mth, row in zip(months_used, R[assets_use].itertuples(index=False, name=None)):
+                        # 1) applico rendimento alle posizioni esistenti (fine mese precedente -> fine mese corrente)
+                        for i, a in enumerate(assets_use):
+                            pos[a] = max(0.0, pos[a] * (1.0 + float(row[i])))
+                        # 2) applico i movimenti nel mese (a fine mese)
+                        sub = pos_delta[pos_delta["Month"] == mth]
+                        if not sub.empty:
+                            for _, rr in sub.iterrows():
+                                ac = rr["AC"]
+                                if ac in pos:
+                                    pos[ac] = max(0.0, pos[ac] + float(rr["PosDelta"]))
+                        wealth_path.append(sum(pos.values()))
+
+                    eff = pd.DataFrame({"Month": months_used, "Wealth_Effective": wealth_path})
+                    current_wealth = float(eff["Wealth_Effective"].iloc[-1] if not eff.empty else 0.0)
+
+                    # --- Scenario atteso MC (1.000): usa media/vol/corr dai rendimenti storici della finestra
+                    hist = R[assets_use].copy()
+                    mu_m = hist.mean().values
+                    cov_m = hist.cov().values
+                    # stabilizza
+                    cov_m = cov_m + np.eye(cov_m.shape[0]) * 1e-10
+
+                    scen = 1000
+                    months_fwd = len(months_used)
+                    rng = np.random.default_rng(12345)
+                    Z = rng.standard_normal(size=(scen * months_fwd, len(assets_use)))
+                    try:
+                        L = np.linalg.cholesky(cov_m)
+                    except np.linalg.LinAlgError:
+                        L = np.linalg.cholesky(cov_m + np.eye(cov_m.shape[0]) * 1e-8)
+                    X = Z @ L.T
+                    sim = (X + mu_m).reshape(scen, months_fwd, len(assets_use))  # scen, months, assets
+
+                    # dinamica pesi mensili (da comp_df): usa peso anno floor(t/12)
+                    w_df = comp_df.copy()
+                    w_df = w_df.sort_values("Anno").reset_index(drop=True)
+                    def _w_for_month_idx(mi: int) -> np.ndarray:
+                        y = int(mi // 12)
+                        if (w_df["Anno"] >= y).any():
+                            r = w_df[w_df["Anno"] >= y].iloc[0]
+                        else:
+                            r = w_df.iloc[-1]
+                        w = np.array([float(r.get(a, 0.0)) for a in assets_use], dtype=float)
+                        s = w.sum()
+                        return w/s if s>0 else np.full_like(w, 1.0/len(w))
+
+                    # cashflows pianificati (portfolio view): contrib add, spese subtract.
+                    # Riutilizzo plan_months: qui considero solo mesi within storia (proxy)
+                    plan_cf_port = np.zeros(months_fwd, dtype=float)
+                    # conferimenti iniziali e periodici: li proietto sui mesi (mese 0 e poi 12*y)
+                    for _, r in cf_y.iterrows():
+                        y = int(r["Anno"])
+                        mi = 12 * y
+                        if 0 <= mi < months_fwd:
+                            # investor sign: conferimenti negativi, spese positive.
+                            # portfolio sign opposto:
+                            plan_cf_port[mi] += -(float(r["Conferimenti"]))  # contrib -> +
+                            plan_cf_port[mi] -= float(r["Spese"])          # spese -> -
+
+                    # Simula ricchezza
+                    W = np.zeros((scen, months_fwd), dtype=float)
+                    w0 = 0.0
+                    for s in range(scen):
+                        wealth = 0.0
+                        for mi in range(months_fwd):
+                            wealth += float(plan_cf_port[mi])
+                            w = _w_for_month_idx(mi)
+                            r_p = float(np.dot(w, sim[s, mi, :]))
+                            wealth = max(0.0, wealth * (1.0 + r_p))
+                            W[s, mi] = wealth
+
+                    p10 = np.percentile(W, 10, axis=0)
+                    p50 = np.percentile(W, 50, axis=0)
+                    p90 = np.percentile(W, 90, axis=0)
+                    att = pd.DataFrame({"Month": months_used, "P10": p10, "P50": p50, "P90": p90})
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=eff["Month"], y=eff["Wealth_Effective"], mode="lines", name="Effettivo (proxy)"))
+                    fig.add_trace(go.Scatter(x=att["Month"], y=att["P50"], mode="lines", name="Atteso (50°)"))
+                    fig.add_trace(go.Scatter(x=att["Month"], y=att["P90"], mode="lines", name="Ottimistico (90°)"))
+                    fig.add_trace(go.Scatter(x=att["Month"], y=att["P10"], mode="lines", name="Pessimistico (10°)"))
+                    fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Montante (€)")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown(f"**Montante finale stimato (proxy):** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    # -----------------------------
+    # 4) (GBI) Stima Probabilità di Successo
+    # -----------------------------
+    if bool(payload.get("gbi", False)):
+        st.markdown("## Stima Probabilità di Successo")
+        st.caption("Stima aggiornata delle probabilità di successo sugli obiettivi residui, considerando il montante attuale e i conferimenti futuri residuali programmati.")
+
+        # Recupera baseline
+        p0 = float(payload.get("gbi_best_success_prob", np.nan) or np.nan)
+        st.markdown(f"**Probabilità di successo iniziale (alla creazione):** {p0:.1%}" if np.isfinite(p0) else "**Probabilità di successo iniziale:** —")
+
+        # stima aggiornata (approccio operativo): usa Monte Carlo su asset class con parametri storici
+        mdb = st.session_state.get("market_database", None)
+        can_mc = isinstance(mdb, dict) and isinstance(mdb.get("df"), pd.DataFrame) and (not mdb["df"].empty)
+        if not can_mc:
+            st.warning("Database Mercati non disponibile: impossibile stimare una probabilità aggiornata.")
+        else:
+            # prepara obiettivi residui (anni scalati)
+            elapsed_years = _elapsed_years_from_ops(ops_df)
+            objectives = payload.get("gbi_objectives", []) if isinstance(payload.get("gbi_objectives"), list) else []
+            residual_obj = []
+            for ob in objectives:
+                ob2 = dict(ob)
+                sched2 = []
+                for s in ob.get("schedule", []) or []:
+                    try:
+                        y = int(s.get("year", 0))
+                        amt = float(s.get("amount", 0.0))
+                    except Exception:
+                        continue
+                    y2 = y - elapsed_years
+                    if y2 > 0 and amt > 0:
+                        sched2.append({"year": y2, "amount": amt})
+                ob2["schedule"] = sched2
+                if sched2:
+                    residual_obj.append(ob2)
+
+            # orizzonte residuo
+            T_tot = int(payload.get("horizon_years", 0) or 1)
+            T_rem = max(1, T_tot - elapsed_years)
+
+            # cash_in residuali (portfolio view)
+            initial_now = float(current_wealth)
+            periodic_amount = float(payload.get("periodic_amount", 0.0) or 0.0)
+            periodic_years = int(payload.get("periodic_years", 0) or 0)
+            freq = str(payload.get("periodic_freq", "Annuale") or "Annuale")
+            per_year = 0.0
+            if periodic_amount != 0.0:
+                if freq.lower().startswith("mens"):
+                    per_year = periodic_amount * 12.0
+                elif freq.lower().startswith("trim"):
+                    per_year = periodic_amount * 4.0
+                elif freq.lower().startswith("sem"):
+                    per_year = periodic_amount * 2.0
+                else:
+                    per_year = periodic_amount * 1.0
+
+            # anni residui di versamenti
+            per_years_rem = max(0, periodic_years - elapsed_years)
+
+            # Estima mu/cov mensili dalle serie storiche
+            dfm = mdb["df"].copy()
+            date_col = None
+            for c in dfm.columns:
+                if str(c).lower().strip() in ["date", "data"]:
+                    date_col = c
+                    break
+            dfm[date_col] = pd.to_datetime(dfm[date_col], errors="coerce")
+            dfm = dfm.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
+            dfm["Month"] = dfm[date_col].dt.to_period("M").dt.to_timestamp()
+
+            comp_df3 = _composition_path_df(payload)
+            comp_df3 = comp_df3.sort_values("Anno").reset_index(drop=True)
+            asset_cols0 = [c for c in comp_df3.columns if c != "Anno"]
+            assets_use = [a for a in asset_cols0 if a in dfm.columns]
+            if not assets_use:
+                st.warning("Asset class non trovate nel Database Mercati: impossibile stimare la probabilità aggiornata.")
+            else:
+                hist = dfm[assets_use].copy()
+                for a in assets_use:
+                    hist[a] = pd.to_numeric(hist[a], errors="coerce").fillna(0.0).clip(lower=-0.9999)
+                mu_m = hist.mean().values
+                cov_m = hist.cov().values + np.eye(len(assets_use))*1e-10
+                scen = 1000
+                months_fwd = int(T_rem * 12)
+                rng = np.random.default_rng(24680)
+                Z = rng.standard_normal(size=(scen * months_fwd, len(assets_use)))
+                try:
+                    L = np.linalg.cholesky(cov_m)
+                except np.linalg.LinAlgError:
+                    L = np.linalg.cholesky(cov_m + np.eye(cov_m.shape[0]) * 1e-8)
+                X = Z @ L.T
+                sim = (X + mu_m).reshape(scen, months_fwd, len(assets_use))
+
+                # pesi mensili residuali: anno = elapsed + floor(mi/12)
+                def _w_for_month_idx(mi: int) -> np.ndarray:
+                    y = elapsed_years + int(mi // 12)
+                    if (comp_df3["Anno"] >= y).any():
+                        r = comp_df3[comp_df3["Anno"] >= y].iloc[0]
+                    else:
+                        r = comp_df3.iloc[-1]
+                    w = np.array([float(r.get(a, 0.0)) for a in assets_use], dtype=float)
+                    s = w.sum()
+                    return w/s if s>0 else np.full_like(w, 1.0/len(w))
+
+                # obiettivi in mesi (fine mese 12*y -1)
+                obj_months = []
+                for ob in residual_obj:
+                    for s in ob.get("schedule", []) or []:
+                        y = int(s.get("year", 0))
+                        amt = float(s.get("amount", 0.0))
+                        if y>0 and amt>0:
+                            m_idx = int(y*12) - 1
+                            if 0 <= m_idx < months_fwd:
+                                obj_months.append((m_idx, amt))
+                obj_months.sort(key=lambda x: x[0])
+
+                # Monte Carlo
+                success = 0
+                for s in range(scen):
+                    wealth = float(initial_now)
+                    ok = True
+                    for mi in range(months_fwd):
+                        # contributi residuali (a inizio anno)
+                        if mi % 12 == 0:
+                            year_i = int(mi//12) + 1
+                            if 1 <= year_i <= per_years_rem:
+                                wealth += float(per_year)
+                        # rendimento
+                        w = _w_for_month_idx(mi)
+                        r_p = float(np.dot(w, sim[s, mi, :]))
+                        wealth = max(0.0, wealth * (1.0 + r_p))
+                        # obiettivi
+                        for (mm, amt) in obj_months:
+                            if mm == mi:
+                                wealth -= amt
+                                if wealth < 0:
+                                    ok = False
+                                break
+                        if not ok:
+                            break
+                    if ok and wealth >= 0:
+                        success += 1
+
+                p_now = success / scen
+                st.metric("Probabilità di successo aggiornata (stima)", f"{p_now:.1%}")
+                if np.isfinite(p0):
+                    st.metric("Variazione vs iniziale", f"{(p_now - p0):+.1%}")
+
+        # -----------------------------
+        # 5) (GBI) Riformula il Portafoglio GBI
+        # -----------------------------
+        st.markdown("## Riformula il Portafoglio GBI")
+        st.caption("Per riformulare la dinamica GBI, si viene reindirizzati alla sezione 'Goal-Based Investing' con i parametri precompilati e riallineati al tempo trascorso.")
+        reform_ctx = {
+            "pid": pid,
+            "payload": payload,
+            "current_wealth": float(current_wealth),
+            "elapsed_years": int(_elapsed_years_from_ops(ops_df)),
+            "start_date": str(pd.Timestamp(start_dt).date()),
+        }
+        st.session_state["gbi_reformulate_context"] = reform_ctx
+
+        auth_qs = ""
+        try:
+            qp = st.query_params
+            if "uwu" in qp and "uwt" in qp:
+                auth_qs = f"uwu={qp.get('uwu')}&uwt={qp.get('uwt')}&"
+        except Exception:
+            pass
+
+        st.markdown(
+            f'<a class="uw-btn" href="?{auth_qs}main=Crea%20Soluzione%20di%20Investimento&crea=Goal-Based%20Investing" target="_self">Apri riformulazione nella sezione GBI</a>',
+            unsafe_allow_html=True
+        )
+
+    # -----------------------------
+    # 6) Modifica Selezione Prodotti
+    # -----------------------------
+    st.markdown("## Modifica Selezione Prodotti")
+    st.caption("Confronto composizione in prodotti (proxy) e asset allocation corrente; calcolo delle modifiche per riallineamento (per asset class).")
+
+    # target corrente: anno elapsed
+    elapsed_years = _elapsed_years_from_ops(ops_df)
+    comp_df2 = comp_df.sort_values("Anno")
+    if (comp_df2["Anno"] >= elapsed_years).any():
+        tr = comp_df2[comp_df2["Anno"] >= elapsed_years].iloc[0]
+    else:
+        tr = comp_df2.iloc[-1]
+    target_now = {a: float(tr.get(a, 0.0)) for a in [c for c in comp_df2.columns if c != "Anno"]}
+    s = sum(target_now.values())
+    if s > 0:
+        target_now = {k: v/s for k, v in target_now.items()}
+
+    # effettivo: ac_values (Value)
+    eff_now = {row["Asset Class"]: float(row["Value"]) for _, row in ac_values.iterrows()}
+    total_now = float(sum(eff_now.values()) or 0.0)
+    if total_now <= 0:
+        st.info("Valore totale effettivo non disponibile: impossibile calcolare suggerimenti di riallocazione.")
+        return
+
+    # suggerimenti: delta valore per asset class
+    recs = []
+    for ac, tw in target_now.items():
+        target_val = tw * total_now
+        curr_val = eff_now.get(ac, 0.0)
+        recs.append({"Asset Class": ac, "Valore attuale (proxy)": curr_val, "Valore target": target_val, "Delta (target−attuale)": target_val - curr_val})
+    df_reb = pd.DataFrame(recs).sort_values("Delta (target−attuale)", ascending=False)
+    st.dataframe(df_reb, use_container_width=True, hide_index=True)
+
+    if st.button("Rialloca", use_container_width=True, key="mon_rebalance_btn"):
+        st.markdown("### Indicazioni operative (per asset class)")
+        buys = df_reb[df_reb["Delta (target−attuale)"] > 0].copy()
+        sells = df_reb[df_reb["Delta (target−attuale)"] < 0].copy()
+
+        if buys.empty and sells.empty:
+            st.success("Il portafoglio risulta già allineato (entro la precisione del proxy).")
+        else:
+            if not sells.empty:
+                st.markdown("**Da ridurre / vendere**")
+                tmp = sells.copy()
+                tmp["Importo stimato"] = (-tmp["Delta (target−attuale)"])
+                st.dataframe(tmp[["Asset Class", "Importo stimato"]], use_container_width=True, hide_index=True)
+            if not buys.empty:
+                st.markdown("**Da incrementare / acquistare**")
+                tmp = buys.copy()
+                tmp["Importo stimato"] = tmp["Delta (target−attuale)"]
+                st.dataframe(tmp[["Asset Class", "Importo stimato"]], use_container_width=True, hide_index=True)
+
+# =======================
 def render_crea_portafoglio():
     ensure_anagrafica_storage()
     ensure_portfolio_storage()
     ensure_asset_selection_storage()
     ensure_market_database_storage()  # necessario per backtesting/MC anche dopo navigazione via link
+    # NOTE: la riformulazione GBI è gestita nella sezione 'Goal-Based Investing';
+    # in 'Asset-Only' non deve essere attiva. Manteniamo flag e contesto per evitare NameError.
+    reform_ctx = None
+    is_reform = False
+
 
     st.markdown(
         '<div class="uw-card"><h2>Crea Soluzione di Investimento</h2>'
@@ -5018,6 +6267,49 @@ def render_crea_portafoglio():
     client_data = anags[client_key].get("data", {})
 
     st.markdown('<div class="uw-card"><h2>Impostazioni Portafoglio</h2></div>', unsafe_allow_html=True)
+    # Prefill in modalità riformulazione
+    if is_reform:
+        _old = reform_ctx.get("payload", {}) or {}
+        _elapsed = int(reform_ctx.get("elapsed_years", 0) or 0)
+
+        # Portafoglio
+        if not st.session_state.get("gbi_pf_name"):
+            st.session_state["gbi_pf_name"] = str(_old.get("portfolio_name", "")).strip()
+
+        # Orizzonte residuo
+        _T_old = int(_old.get("horizon_years", 0) or 0)
+        _T_rem = max(1, _T_old - _elapsed)
+        st.session_state.setdefault("gbi_horizon", _T_rem)
+
+        # Montante iniziale = montante attuale (modificabile)
+        st.session_state.setdefault("gbi_initial", float(reform_ctx.get("current_wealth", 0.0) or 0.0))
+
+        # Conferimenti periodici: residui
+        st.session_state.setdefault("gbi_periodic_amt", float(_old.get("periodic_amount", 0.0) or 0.0))
+        _per_years_old = int(_old.get("periodic_years", 0) or 0)
+        st.session_state.setdefault("gbi_periodic_years", max(0, _per_years_old - _elapsed))
+        st.session_state.setdefault("gbi_freq", str(_old.get("periodic_freq", "Annuale") or "Annuale"))
+
+        # Obiettivi residui: scala gli anni
+        if "gbi_objectives" not in st.session_state:
+            _objs = _old.get("gbi_objectives", []) if isinstance(_old.get("gbi_objectives", []), list) else []
+            _res = []
+            for ob in _objs:
+                ob2 = dict(ob)
+                sched2 = []
+                for s in ob.get("schedule", []) or []:
+                    try:
+                        y = int(s.get("year", 0))
+                        amt = float(s.get("amount", 0.0))
+                    except Exception:
+                        continue
+                    y2 = y - _elapsed
+                    if y2 > 0 and amt > 0:
+                        sched2.append({"year": y2, "amount": amt})
+                ob2["schedule"] = sched2
+                if sched2:
+                    _res.append(ob2)
+            st.session_state["gbi_objectives"] = _res
     portfolio_name = st.text_input("Nome del Portafoglio", value="", key="pf_name").strip()
 
     objective = "Massimizzazione del Rendimento Atteso dato un livello di rischio tollerato"
@@ -6107,12 +7399,15 @@ def render_crea_portafoglio():
         if portfolio_name == "":
             st.error("Inserire un Nome per il Portafoglio prima di salvare.")
         else:
-            base_id = f"{client_key}::{portfolio_name}"
-            pid = base_id
-            k = 2
-            while pid in st.session_state["portfolios"]:
-                pid = f"{base_id} ({k})"
-                k += 1
+            if is_reform:
+                pid = str(reform_ctx.get("pid"))
+            else:
+                base_id = f"{client_key}::{portfolio_name}"
+                pid = base_id
+                k = 2
+                while pid in st.session_state["portfolios"]:
+                    pid = f"{base_id} ({k})"
+                    k += 1
 
             payload = {
                 "id": pid,
@@ -6133,7 +7428,8 @@ def render_crea_portafoglio():
             }
             st.session_state["portfolios"][pid] = payload
             st.session_state["client_portfolios"].setdefault(client_key, [])
-            st.session_state["client_portfolios"][client_key].append(pid)
+            if pid not in st.session_state["client_portfolios"][client_key]:
+                st.session_state["client_portfolios"][client_key].append(pid)
             st.success(f'Portafoglio "{portfolio_name}" salvato correttamente per il cliente selezionato.')
     persist_portfolios_from_session()
     persist_client_grids_from_session()
@@ -6151,14 +7447,26 @@ def render_crea_soluzione_gbi():
         unsafe_allow_html=True
     )
 
-    sub = st.radio(
-        "Sotto-sezione",
-        ["Nuovo Portafoglio", "Modifica Portafoglio"],
-        horizontal=True,
-        key="gbi_pf_subsection"
-    )
+    
+    reform_ctx = st.session_state.get("gbi_reformulate_context", None)
+    is_reform = isinstance(reform_ctx, dict) and isinstance(reform_ctx.get("payload"), dict) and bool(reform_ctx.get("pid"))
 
-    if sub == "Modifica Portafoglio":
+    if is_reform:
+        sub = "Riformula Portafoglio"
+        st.markdown(
+            '<div class="uw-card"><h3>Riformulazione (da Monitoraggio)</h3>'
+            '<p>I parametri sono precompilati e riallineati al tempo trascorso. Al salvataggio, il portafoglio sostituisce quello precedente.</p></div>',
+            unsafe_allow_html=True
+        )
+    else:
+        sub = st.radio(
+            "Sotto-sezione",
+            ["Nuovo Portafoglio", "Modifica Portafoglio"],
+            horizontal=True,
+            key="gbi_pf_subsection"
+        )
+
+    if (not is_reform) and sub == "Modifica Portafoglio":
         pf = st.session_state.get("portfolios", {})
         if not pf:
             st.info("Nessun portafoglio creato finora.")
@@ -6183,15 +7491,22 @@ def render_crea_soluzione_gbi():
         st.warning("Devi creare l’Anagrafica Cliente prima di procedere.")
         return
 
-    client_keys = list(anags.keys())
-    labels = []
-    for k in client_keys:
-        d = anags[k].get("data", {})
-        labels.append(f'{d.get("nome","").strip()} {d.get("cognome","").strip()}  —  ({k})')
+    # In modalità riformulazione (da Monitoraggio) il cliente è già identificato
+    if is_reform:
+        _old = reform_ctx.get("payload", {})
+        client_key = _old.get("client_key", "")
+        _client_data = anags.get(client_key, {}).get("data", {})
+        st.markdown(f"**Cliente selezionato:** {_client_data.get('nome','').strip()} {_client_data.get('cognome','').strip()}  —  ({client_key})")
+    else:
+        client_keys = list(anags.keys())
+        labels = []
+        for k in client_keys:
+            d = anags[k].get("data", {})
+            labels.append(f'{d.get("nome","").strip()} {d.get("cognome","").strip()}  —  ({k})')
 
-    sel_label = st.selectbox("Seleziona Cliente / Investitore", labels, key="gbi_client_sel")
-    client_key = client_keys[labels.index(sel_label)]
-    _client_data = anags[client_key].get("data", {})
+        sel_label = st.selectbox("Seleziona Cliente / Investitore", labels, key="gbi_client_sel")
+        client_key = client_keys[labels.index(sel_label)]
+        _client_data = anags[client_key].get("data", {})
 
     st.markdown('<div class="uw-card"><h2>Impostazioni Portafoglio</h2></div>', unsafe_allow_html=True)
     portfolio_name = st.text_input("Nome del Portafoglio", value="", key="gbi_pf_name").strip()
@@ -8046,7 +9361,8 @@ if main_section == "Tools":
         ),
         "Database Mercati": "Caricamento e salvataggio del Database Mercati (serie storiche dei rendimenti) utilizzabile nelle analisi.",
         "Database Prodotti": "Caricamento e salvataggio del Database Prodotti (universo ETF/fondi e metriche) utilizzabile nella selezione AI dei prodotti.",
-    }
+            "Serie Storiche Prodotti": "Caricamento e salvataggio del Database Prezzi Prodotti (serie storiche dei prezzi per ISIN) utilizzabile nel monitoraggio e nelle analisi.",
+}
     header_title = f"Tools → {tools_sub}"
     header_desc = _tools_desc.get(tools_sub, "Strumenti operativi dell’applicazione.")
 elif main_section == "Crea Soluzione di Investimento":
@@ -8154,6 +9470,11 @@ if main_section == "Tools":
 
     if tools_sub == "Database Prodotti":
         render_database_prodotti()
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.stop()
+
+    if tools_sub == "Serie Storiche Prodotti":
+        render_serie_storiche_prodotti()
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
