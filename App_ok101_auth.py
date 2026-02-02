@@ -6078,20 +6078,175 @@ def render_monitoraggio_portafoglio():
                 trades_df = pd.DataFrame(trades)
                 trades_df["__ord"] = trades_df["Azione"].map({"VENDI": 0, "COMPRA": 1}).fillna(2)
                 trades_df = trades_df.sort_values(["__ord", "Asset Class", "ISIN"]).drop(columns=["__ord"])
-                st.markdown("### Operazioni suggerite per riallinearsi ai pesi Target")
+
+                # Calcola i "Nuovi pesi" (pesi per asset class) dopo l'esecuzione delle operazioni suggerite
+                try:
+                    _new_pos = _positions_df.copy()
+                    # Applica le operazioni (variazione quantità per ISIN)
+                    for _i, _tr in trades_df.iterrows():
+                        _isin = str(_tr.get("ISIN", "")).strip()
+                        _ac = str(_tr.get("Asset Class", "")).strip()
+                        _px = float(_tr.get("Prezzo unitario", 0.0) or 0.0)
+                        _qty = float(_tr.get("Quantità", 0.0) or 0.0)
+                        _sign = 1.0 if str(_tr.get("Azione", "")).upper() == "COMPRA" else -1.0
+                        _dq = _sign * _qty
+
+                        _mask = _new_pos["ISIN"].astype(str) == _isin
+                        if _mask.any():
+                            _new_pos.loc[_mask, "Qty"] = _new_pos.loc[_mask, "Qty"].astype(float) + _dq
+                        else:
+                            # Caso raro: acquisto di un titolo non presente (dipende dalla logica). Lo aggiungiamo.
+                            _new_pos = pd.concat([
+                                _new_pos,
+                                pd.DataFrame([{
+                                    "ISIN": _isin,
+                                    "Asset Class": _ac,
+                                    "Qty": _dq,
+                                    "Price": _px,
+                                    "Value": _dq * _px,
+                                }])
+                            ], ignore_index=True)
+
+                    _new_pos["Qty"] = _new_pos["Qty"].astype(float)
+                    _new_pos["Price"] = _new_pos["Price"].astype(float)
+                    # Rimuovi posizioni azzerate
+                    _new_pos = _new_pos[_new_pos["Qty"] > 1e-9].copy()
+                    _new_pos["Value"] = _new_pos["Qty"] * _new_pos["Price"]
+
+                    _ac_vals = _new_pos.groupby("Asset Class")["Value"].sum()
+                    _tot_new = float(_ac_vals.sum() or 0.0)
+                    if _tot_new > 0:
+                        _ac_w = (_ac_vals / _tot_new).to_dict()
+                        trades_df["Nuovi pesi"] = trades_df["Asset Class"].map(lambda _a: f"{_ac_w.get(_a, 0.0) * 100:.2f}%")
+                    else:
+                        trades_df["Nuovi pesi"] = ""
+                except Exception:
+                    trades_df["Nuovi pesi"] = ""
+                st.markdown('<div style="font-size:0.95rem; font-weight:600; margin-top:0.25rem;">Operazioni suggerite per riallinearsi ai pesi Target</div>', unsafe_allow_html=True)
                 st.dataframe(trades_df, use_container_width=True, hide_index=True)
+
 
     # -----------------------------
     # 3) Performance Money Weighted
     # -----------------------------
-    st.markdown("## Performance Money Weighted")
-    st.caption("Montante effettivo stimato (proxy basata su rendimenti per asset class) confrontato con un percorso atteso (Monte Carlo 1.000 scenari).")
+    st.markdown('<div style="font-size:0.95rem; font-weight:600; margin-top:0.25rem;">Performance Money Weighted</div>', unsafe_allow_html=True)
+    st.caption("Montante effettivo (basato su prezzi prodotti e operazioni) confrontato con montante atteso (Monte Carlo 1.000 scenari) costruito su conferimenti/spese target e asset allocation dinamica.")
 
+    import datetime as _dt
+
+    # --- Costruisci montante effettivo da operazioni + prezzi prodotti
+    ensure_product_prices_database_storage()
+    ppdb = st.session_state.get("product_prices_database", None)
+    prices_df = ppdb.get("df") if isinstance(ppdb, dict) else None
+
+    eff_monthly = None
+    current_wealth = float("nan")
+
+    if ops_df is None or not isinstance(ops_df, pd.DataFrame) or ops_df.empty:
+        st.warning("Operazioni non disponibili: impossibile calcolare il montante effettivo.")
+    elif prices_df is None or not isinstance(prices_df, pd.DataFrame) or prices_df.empty:
+        st.warning("Database Prezzi Prodotti non disponibile: impossibile calcolare il montante effettivo.")
+    else:
+        p = prices_df.copy()
+        # individua colonna data
+        _date_col = None
+        for c in p.columns:
+            if str(c).strip().lower() in ["date", "data"]:
+                _date_col = c
+                break
+        if _date_col is None:
+            st.warning("Database Prezzi Prodotti: colonna data non trovata.")
+        else:
+            p[_date_col] = pd.to_datetime(p[_date_col], errors="coerce")
+            p = p.dropna(subset=[_date_col]).sort_values(_date_col).reset_index(drop=True)
+            p = p.set_index(_date_col)
+            # normalizza ISIN (colonne)
+            p.columns = [str(c).strip().upper() for c in p.columns]
+
+            # operazioni: normalizza date e ISIN
+            ops_tmp = ops_df.copy()
+            ops_tmp["ISIN"] = ops_tmp["ISIN"].astype(str).str.strip().str.upper()
+            ops_tmp["D"] = pd.to_datetime(ops_tmp["Date"], errors="coerce").dt.normalize()
+            ops_tmp = ops_tmp.dropna(subset=["D"])
+            if ops_tmp.empty:
+                st.warning("Operazioni: nessuna data valida.")
+            else:
+                start_d = ops_tmp["D"].min()
+                today = pd.Timestamp(_dt.date.today())
+                # limita prezzi al range utile
+                p = p[(p.index >= start_d) & (p.index <= today)].copy()
+                if p.empty:
+                    st.warning("Database Prezzi Prodotti: nessun dato nel periodo di monitoraggio.")
+                else:
+                    # prezzi numerici e forward-fill
+                    for c in p.columns:
+                        p[c] = pd.to_numeric(p[c], errors="coerce")
+                    p = p.sort_index()
+                    p = p.ffill()
+
+                    # ISIN in portafoglio (solo quelli nelle operazioni e presenti nel DB prezzi)
+                    isins_ops = sorted(set([x for x in ops_tmp["ISIN"].unique().tolist() if x and x != "NAN"]))
+                    isins = [i for i in isins_ops if i in p.columns]
+                    missing_isins = [i for i in isins_ops if i not in p.columns]
+                    if missing_isins:
+                        st.warning("Prezzi mancanti per i seguenti ISIN (non inclusi nel montante effettivo): " + ", ".join(missing_isins))
+
+                    if not isins:
+                        st.warning("Nessun ISIN delle operazioni è presente nel Database Prezzi Prodotti.")
+                    else:
+                        p_use = p[isins].copy()
+
+                        # Trades: quantità firmata
+                        ops_tmp["SignedQty"] = np.where(ops_tmp["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * ops_tmp["Quantita"].astype(float)
+                        trades = ops_tmp.groupby(["D", "ISIN"], as_index=False)["SignedQty"].sum()
+
+                        # Allinea date operazioni ai giorni disponibili nei prezzi (primo giorno prezzi >= data op)
+                        price_dates = p_use.index.values
+                        trade_rows = []
+                        for _, r in trades.iterrows():
+                            d = pd.Timestamp(r["D"])
+                            isin = str(r["ISIN"])
+                            qty = float(r["SignedQty"])
+                            # trova prima data prezzo >= d
+                            pos = np.searchsorted(price_dates, np.datetime64(d), side="left")
+                            if pos >= len(price_dates):
+                                continue
+                            aligned_d = pd.Timestamp(price_dates[pos]).normalize()
+                            trade_rows.append((aligned_d, isin, qty))
+
+                        if not trade_rows:
+                            st.warning("Nessuna operazione allineabile alle date del Database Prezzi Prodotti.")
+                        else:
+                            tr_df = pd.DataFrame(trade_rows, columns=["D_aligned", "ISIN", "SignedQty"])
+                            tr_piv = tr_df.pivot_table(index="D_aligned", columns="ISIN", values="SignedQty", aggfunc="sum").fillna(0.0)
+                            tr_piv = tr_piv.reindex(p_use.index, fill_value=0.0)
+
+                            holdings = tr_piv.cumsum()
+                            wealth = (holdings * p_use).sum(axis=1)
+
+                            if wealth.dropna().empty:
+                                st.warning("Impossibile calcolare il montante effettivo (prezzi non disponibili dopo i trade).")
+                            else:
+                                wealth = wealth.fillna(method="ffill").fillna(0.0)
+                                current_wealth = float(wealth.iloc[-1])
+
+                                # Monthly (month start) per confronto con Monte Carlo
+                                eff_monthly = wealth.resample("MS").last().to_frame("Wealth_Effective")
+                                eff_monthly = eff_monthly.reset_index().rename(columns={eff_monthly.columns[0]: "Month"})
+
+    # --- Scenario atteso (Monte Carlo 1.000) su flussi target e AA dinamica (asset class)
     mdb = st.session_state.get("market_database", None)
+    if eff_monthly is None or eff_monthly.empty:
+        st.info("Montante effettivo non disponibile: verrà mostrato solo lo scenario atteso (se disponibile).")
     if not isinstance(mdb, dict) or not isinstance(mdb.get("df"), pd.DataFrame) or mdb["df"].empty:
-        st.warning("Database Mercati non disponibile: impossibile stimare montanti e scenario atteso.")
-        current_wealth = float(tot_val)
-        st.info(f"Montante proxy (senza rendimenti): {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+        if eff_monthly is not None and not eff_monthly.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=eff_monthly["Month"], y=eff_monthly["Wealth_Effective"], mode="lines", name="Effettivo"))
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Montante (€)")
+            st.plotly_chart(fig, use_container_width=True)
+            st.markdown(f"**Montante alla data odierna:** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+        else:
+            st.warning("Database Mercati non disponibile: impossibile stimare il montante atteso (Monte Carlo).")
     else:
         dfm = mdb["df"].copy()
         # individua colonna data
@@ -6102,67 +6257,36 @@ def render_monitoraggio_portafoglio():
                 break
         if date_col is None:
             st.warning("Database Mercati: colonna data non trovata.")
-            current_wealth = float(tot_val)
         else:
             dfm[date_col] = pd.to_datetime(dfm[date_col], errors="coerce")
             dfm = dfm.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
             dfm["Month"] = dfm[date_col].dt.to_period("M").dt.to_timestamp()
 
-            # asset class da usare: unione target+effettivo
-            assets_use = sorted(list(set([a for a in asset_cols] + comp_cmp["Asset Class"].astype(str).tolist())))
-            assets_use = [a for a in assets_use if a in dfm.columns]
+            # asset class da usare: quelle presenti nella AA dinamica e nel db mercati
+            assets_use = [a for a in asset_cols if a in dfm.columns]
             if not assets_use:
-                st.warning("Nessuna asset class del portafoglio è presente nel Database Mercati.")
-                current_wealth = float(tot_val)
+                st.warning("Nessuna asset class del portafoglio è presente nel Database Mercati: impossibile Monte Carlo.")
             else:
                 # rendimenti mensili disponibili
                 R = dfm[["Month"] + assets_use].copy()
                 for a in assets_use:
                     R[a] = pd.to_numeric(R[a], errors="coerce").fillna(0.0).clip(lower=-0.9999)
 
-                # limita finestra a partire dalla prima operazione
-                R = R[R["Month"] >= start_month].copy()
+                # limita finestra: dalla data start_month (inizio monitoraggio) fino a oggi
+                R = R[(R["Month"] >= start_month) & (R["Month"] <= pd.Timestamp(_dt.date.today()).to_period("M").to_timestamp())].copy()
                 if R.empty:
-                    st.warning("Database Mercati: nessuna osservazione dalla data di inizio operazioni.")
-                    current_wealth = float(tot_val)
+                    st.warning("Database Mercati: nessuna osservazione nel periodo di monitoraggio.")
                 else:
-                    # --- Montante effettivo (proxy): posizioni per asset class, alimentate dai flussi BUY/SELL, poi applico rendimenti.
-                    # Aggrega flussi per mese e asset class: BUY -> +pos, SELL -> -pos (assumo controvalore).
-                    ops_pos = ops_df.copy()
-                    ops_pos["AC"] = ops_pos["Asset Class"].astype(str).replace({"": "(non classificato)"})
-                    ops_pos = ops_pos[ops_pos["AC"] != "(non classificato)"].copy()
-                    ops_pos["PosDelta"] = np.where(ops_pos["Tipo"].str.upper()=="BUY", 1.0, -1.0) * ops_pos["Importo"].astype(float)
-                    pos_delta = ops_pos.groupby(["Month", "AC"], as_index=False)["PosDelta"].sum()
-
-                    # inizializza posizioni a zero
-                    pos = {a: 0.0 for a in assets_use}
-                    wealth_path = []
                     months_used = R["Month"].tolist()
-                    for mth, row in zip(months_used, R[assets_use].itertuples(index=False, name=None)):
-                        # 1) applico rendimento alle posizioni esistenti (fine mese precedente -> fine mese corrente)
-                        for i, a in enumerate(assets_use):
-                            pos[a] = max(0.0, pos[a] * (1.0 + float(row[i])))
-                        # 2) applico i movimenti nel mese (a fine mese)
-                        sub = pos_delta[pos_delta["Month"] == mth]
-                        if not sub.empty:
-                            for _, rr in sub.iterrows():
-                                ac = rr["AC"]
-                                if ac in pos:
-                                    pos[ac] = max(0.0, pos[ac] + float(rr["PosDelta"]))
-                        wealth_path.append(sum(pos.values()))
-
-                    eff = pd.DataFrame({"Month": months_used, "Wealth_Effective": wealth_path})
-                    current_wealth = float(eff["Wealth_Effective"].iloc[-1] if not eff.empty else 0.0)
+                    months_fwd = len(months_used)
 
                     # --- Scenario atteso MC (1.000): usa media/vol/corr dai rendimenti storici della finestra
                     hist = R[assets_use].copy()
                     mu_m = hist.mean().values
                     cov_m = hist.cov().values
-                    # stabilizza
                     cov_m = cov_m + np.eye(cov_m.shape[0]) * 1e-10
 
                     scen = 1000
-                    months_fwd = len(months_used)
                     rng = np.random.default_rng(12345)
                     Z = rng.standard_normal(size=(scen * months_fwd, len(assets_use)))
                     try:
@@ -6170,11 +6294,10 @@ def render_monitoraggio_portafoglio():
                     except np.linalg.LinAlgError:
                         L = np.linalg.cholesky(cov_m + np.eye(cov_m.shape[0]) * 1e-8)
                     X = Z @ L.T
-                    sim = (X + mu_m).reshape(scen, months_fwd, len(assets_use))  # scen, months, assets
+                    sim = (X + mu_m).reshape(scen, months_fwd, len(assets_use))
 
                     # dinamica pesi mensili (da comp_df): usa peso anno floor(t/12)
-                    w_df = comp_df.copy()
-                    w_df = w_df.sort_values("Anno").reset_index(drop=True)
+                    w_df = comp_df.copy().sort_values("Anno").reset_index(drop=True)
                     def _w_for_month_idx(mi: int) -> np.ndarray:
                         y = int(mi // 12)
                         if (w_df["Anno"] >= y).any():
@@ -6185,48 +6308,52 @@ def render_monitoraggio_portafoglio():
                         s = w.sum()
                         return w/s if s>0 else np.full_like(w, 1.0/len(w))
 
-                    # cashflows pianificati (portfolio view): contrib add, spese subtract.
-                    # Riutilizzo plan_months: qui considero solo mesi within storia (proxy)
+                    # cashflows pianificati (portfolio sign): conferimenti +, spese -
                     plan_cf_port = np.zeros(months_fwd, dtype=float)
-                    # conferimenti iniziali e periodici: li proietto sui mesi (mese 0 e poi 12*y)
                     for _, r in cf_y.iterrows():
                         y = int(r["Anno"])
                         mi = 12 * y
                         if 0 <= mi < months_fwd:
-                            # investor sign: conferimenti negativi, spese positive.
-                            # portfolio sign opposto:
-                            plan_cf_port[mi] += -(float(r["Conferimenti"]))  # contrib -> +
+                            plan_cf_port[mi] += -(float(r["Conferimenti"]))  # conferimenti -> +
                             plan_cf_port[mi] -= float(r["Spese"])          # spese -> -
 
                     # Simula ricchezza
                     W = np.zeros((scen, months_fwd), dtype=float)
-                    w0 = 0.0
                     for s in range(scen):
-                        wealth = 0.0
+                        wealth_s = 0.0
                         for mi in range(months_fwd):
-                            wealth += float(plan_cf_port[mi])
+                            wealth_s += float(plan_cf_port[mi])
                             w = _w_for_month_idx(mi)
                             r_p = float(np.dot(w, sim[s, mi, :]))
-                            wealth = max(0.0, wealth * (1.0 + r_p))
-                            W[s, mi] = wealth
+                            wealth_s = max(0.0, wealth_s * (1.0 + r_p))
+                            W[s, mi] = wealth_s
 
                     p10 = np.percentile(W, 10, axis=0)
                     p50 = np.percentile(W, 50, axis=0)
                     p90 = np.percentile(W, 90, axis=0)
                     att = pd.DataFrame({"Month": months_used, "P10": p10, "P50": p50, "P90": p90})
 
+                    # Allinea effettivo ai mesi usati (se disponibile)
                     fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=eff["Month"], y=eff["Wealth_Effective"], mode="lines", name="Effettivo"))
+                    if eff_monthly is not None and not eff_monthly.empty:
+                        eff_plot = eff_monthly.copy()
+                        eff_plot["Month"] = pd.to_datetime(eff_plot["Month"])
+                        # reindex su months_used
+                        eff_plot = eff_plot.set_index("Month").reindex(pd.to_datetime(months_used)).ffill().reset_index().rename(columns={"index":"Month"})
+                        fig.add_trace(go.Scatter(x=eff_plot["Month"], y=eff_plot["Wealth_Effective"], mode="lines", name="Effettivo"))
                     fig.add_trace(go.Scatter(x=att["Month"], y=att["P50"], mode="lines", name="Atteso (50°)"))
                     fig.add_trace(go.Scatter(x=att["Month"], y=att["P90"], mode="lines", name="Ottimistico (90°)"))
                     fig.add_trace(go.Scatter(x=att["Month"], y=att["P10"], mode="lines", name="Pessimistico (10°)"))
                     fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Montante (€)")
                     st.plotly_chart(fig, use_container_width=True)
 
-                    st.markdown(f"**Montante finale stimato (proxy):** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+                    if eff_monthly is not None and not eff_monthly.empty:
+                        st.markdown(f"**Montante alla data odierna:** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+                    else:
+                        st.info("Montante effettivo non disponibile: mostrato solo lo scenario atteso.")
 
     # -----------------------------
-    # 4) (GBI) Stima Probabilità di Successo
+    # 4) (GBI) Stima Probabilità di S di Successo
     # -----------------------------
     if bool(payload.get("gbi", False)):
         st.markdown("## Stima Probabilità di Successo")
