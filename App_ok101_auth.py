@@ -5882,6 +5882,8 @@ def render_monitoraggio_portafoglio():
             .to_dict()
         )
 
+        tmpv = None
+
         rows = []
         missing_prices = []
         for isin, qty in qty_by_isin.items():
@@ -5989,6 +5991,95 @@ def render_monitoraggio_portafoglio():
             st.markdown("**Date di revisione dell’asset allocation (cambiamenti target):** non disponibili.")
         comp_cmp_display = comp_cmp.rename(columns={"Weight": "Effettivo"})
         st.dataframe(comp_cmp_display[["Asset Class", "Target", "Effettivo", "Gap (Effettivo − Target)"]], use_container_width=True, hide_index=True)
+
+
+    # -----------------------------
+    # Bottone: Ribilancia (operazioni su prodotti per riallineamento ai Target)
+    # -----------------------------
+    st.markdown("")  # spacer
+    if st.button("Ribilancia"):
+        # Richiede: ricostruzione posizioni per ISIN con Qty/Price/Value (tmpv) e target_df già calcolati
+        _positions_df = tmpv.copy() if isinstance(tmpv, pd.DataFrame) else None
+
+        if _positions_df is None or _positions_df.empty or tot_val <= 0:
+            st.warning("Per calcolare il ribilanciamento è necessario disporre di quantità e prezzi correnti dei prodotti (Tools → Serie Storiche Prodotti) e di operazioni valide.")
+        else:
+            # Valori correnti per asset class
+            cur_by_ac = _positions_df.groupby("Asset Class", as_index=True)["Value"].sum()
+
+            # Target per asset class (normalizzato)
+            tdf = target_df.copy()
+            if "Asset Class" in tdf.columns:
+                tdf = tdf.set_index("Asset Class")
+            tdf["Target"] = pd.to_numeric(tdf["Target"], errors="coerce").fillna(0.0)
+            t_sum = float(tdf["Target"].sum() or 0.0)
+            if t_sum > 0:
+                tdf["Target"] = tdf["Target"] / t_sum
+
+            desired_by_ac = tdf["Target"] * float(tot_val)
+
+            all_ac = sorted(set(cur_by_ac.index.tolist()) | set(desired_by_ac.index.tolist()))
+            trades = []
+            notes = []
+
+            for ac in all_ac:
+                cur_val = float(cur_by_ac.get(ac, 0.0))
+                des_val = float(desired_by_ac.get(ac, 0.0))
+                delta_val = des_val - cur_val  # >0 compra, <0 vendi
+
+                if abs(delta_val) < 1e-6:
+                    continue
+
+                sub = _positions_df[_positions_df["Asset Class"] == ac].copy()
+                if sub.empty:
+                    notes.append(f"- Asset class '{ac}': target ≠ 0 ma nessun prodotto presente; impossibile ribilanciare con i soli prodotti in portafoglio.")
+                    continue
+
+                # Seleziona un solo prodotto per asset class (minimo numero di operazioni)
+                sub = sub.sort_values("Value", ascending=False)
+                r0 = sub.iloc[0]
+                isin = str(r0["ISIN"])
+                px = float(r0["Price"] or 0.0)
+                qty_now = float(r0["Qty"] or 0.0)
+
+                if px <= 0:
+                    notes.append(f"- ISIN {isin}: prezzo corrente non valido; impossibile calcolare la quantità da negoziare.")
+                    continue
+
+                raw_qty = delta_val / px
+                qty_trade = int(round(raw_qty))  # quantità intera
+
+                if qty_trade == 0:
+                    continue
+
+                if qty_trade < 0:
+                    # Non vendere oltre la quantità disponibile
+                    qty_trade = -min(int(abs(qty_trade)), int(math.floor(qty_now + 1e-9)))
+
+                if qty_trade == 0:
+                    continue
+
+                action = "COMPRA" if qty_trade > 0 else "VENDI"
+                trades.append({
+                    "ISIN": isin,
+                    "Asset Class": ac,
+                    "Azione": action,
+                    "Quantità": abs(qty_trade),
+                    "Prezzo unitario": px,
+                    "Controvalore stimato (€)": abs(qty_trade) * px,
+                })
+
+            if notes:
+                st.info("Limitazioni / note:\n" + "\n".join(notes))
+
+            if not trades:
+                st.success("Nessun ribilanciamento necessario (o non calcolabile con i dati disponibili).")
+            else:
+                trades_df = pd.DataFrame(trades)
+                trades_df["__ord"] = trades_df["Azione"].map({"VENDI": 0, "COMPRA": 1}).fillna(2)
+                trades_df = trades_df.sort_values(["__ord", "Asset Class", "ISIN"]).drop(columns=["__ord"])
+                st.markdown("### Operazioni suggerite per riallinearsi ai pesi Target")
+                st.dataframe(trades_df, use_container_width=True, hide_index=True)
 
     # -----------------------------
     # 3) Performance Money Weighted
