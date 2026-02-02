@@ -5328,6 +5328,7 @@ def render_monitoraggio_portafoglio():
     ensure_portfolio_storage()
     ensure_product_database_storage()
     ensure_market_database_storage()
+    ensure_product_prices_database_storage()
 
     st.markdown(
         '<div class="uw-card"><h2>Monitoraggio Portafoglio</h2>'
@@ -5837,17 +5838,88 @@ def render_monitoraggio_portafoglio():
     # 2) Analisi Composizione Portafoglio
     # -----------------------------
     st.markdown('<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Analisi Composizione Portafoglio</div>', unsafe_allow_html=True)
-    st.caption("Confronto tra composizione effettiva (prodotti → asset class) e asset allocation target dinamica al tempo trascorso.")
+    st.caption("Confronto tra composizione effettiva (prodotti → asset class) e asset allocation target dinamica al tempo trascorso.")    # costruisci composizione effettiva (prodotti → asset class) usando:
+    # 1) Quantità attuali (somma algebrica BUY/SELL)
+    # 2) Prezzo corrente (ultimo prezzo disponibile ≤ oggi)
+    # 3) Aggregazione per asset class
+    prices_payload = st.session_state.get("product_prices_database", None)
+    prices_df = None
+    if isinstance(prices_payload, dict) and isinstance(prices_payload.get("df"), pd.DataFrame):
+        prices_df = prices_payload.get("df").copy()
 
-    # costruisci esposizione per asset class su base flussi netti (proxy)
-    ops_ac = ops_df.copy()
-    ops_ac["Signed"] = np.where(ops_ac["Tipo"].str.upper() == "BUY", 1.0, -1.0) * ops_ac["Importo"].astype(float)
-    ac_values = ops_ac.groupby("Asset Class", as_index=False)["Signed"].sum()
-    ac_values = ac_values[ac_values["Asset Class"].astype(str).str.strip() != ""].copy()
-    ac_values["Value"] = ac_values["Signed"].clip(lower=0.0)  # evita negativi (vendite > acquisti)
+    ac_values = None
+
+    if prices_df is None or prices_df.empty:
+        st.warning("Database Prezzi Prodotti non disponibile: la composizione effettiva sarà stimata in modalità proxy (flussi netti).")
+    else:
+        # normalizza struttura prezzi: Date + colonne ISIN
+        try:
+            prices_df = prices_df.copy()
+            prices_df.columns = [str(c).strip().upper() for c in prices_df.columns]
+            if "DATE" in prices_df.columns:
+                prices_df = prices_df.rename(columns={"DATE": "Date"})
+            prices_df["Date"] = pd.to_datetime(prices_df["Date"], errors="coerce")
+            prices_df = prices_df.dropna(subset=["Date"]).sort_values("Date")
+            prices_df = prices_df.set_index("Date")
+        except Exception:
+            prices_df = None
+
+    if prices_df is not None and not prices_df.empty:
+        today = pd.Timestamp.today().normalize()
+
+        # quantità attuali per ISIN
+        ops_q = ops_df.copy()
+        ops_q["SignedQty"] = np.where(ops_q["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * ops_q["Quantita"].astype(float)
+        qty_by_isin = ops_q.groupby("ISIN", as_index=True)["SignedQty"].sum()
+        qty_by_isin = qty_by_isin[qty_by_isin > 0].copy()
+
+        # mappa ISIN -> Asset Class (da lookup già effettuato su ops_df)
+        isin_to_ac = (
+            ops_df[["ISIN", "Asset Class"]]
+            .dropna()
+            .drop_duplicates(subset=["ISIN"])
+            .set_index("ISIN")["Asset Class"]
+            .to_dict()
+        )
+
+        rows = []
+        missing_prices = []
+        for isin, qty in qty_by_isin.items():
+            isin_norm = str(isin).strip().upper()
+            if isin_norm not in prices_df.columns:
+                missing_prices.append(isin_norm)
+                continue
+            s = prices_df[isin_norm]
+            s = s.loc[:today].dropna()
+            if s.empty:
+                missing_prices.append(isin_norm)
+                continue
+            px = float(s.iloc[-1])
+            ac = str(isin_to_ac.get(isin, "")).strip()
+            if ac == "":
+                ac = "(non classificato)"
+            rows.append({"ISIN": isin_norm, "Asset Class": ac, "Qty": float(qty), "Price": px, "Value": float(qty) * px})
+
+        if missing_prices:
+            st.warning("Prezzo corrente non disponibile (o non presente nel database) per alcuni ISIN: " + ", ".join(missing_prices))
+
+        if rows:
+            tmpv = pd.DataFrame(rows)
+            ac_values = tmpv.groupby("Asset Class", as_index=False)["Value"].sum()
+        else:
+            ac_values = None
+
+    if ac_values is None:
+        # fallback proxy: esposizione per asset class su base flussi netti
+        ops_ac = ops_df.copy()
+        ops_ac["Signed"] = np.where(ops_ac["Tipo"].str.upper() == "BUY", 1.0, -1.0) * ops_ac["Importo"].astype(float)
+        ac_values = ops_ac.groupby("Asset Class", as_index=False)["Signed"].sum()
+        ac_values = ac_values[ac_values["Asset Class"].astype(str).str.strip() != ""].copy()
+        ac_values["Value"] = ac_values["Signed"].clip(lower=0.0)  # evita negativi (vendite > acquisti)
+
     tot_val = float(ac_values["Value"].sum() or 0.0)
     if tot_val <= 0:
-        st.warning("Non è stato possibile ricostruire una composizione effettiva significativa (flussi netti non positivi).")
+        st.warning("Non è stato possibile ricostruire una composizione effettiva significativa.")
         ac_values = pd.DataFrame({"Asset Class": ["(non disponibile)"], "Value": [0.0]})
         tot_val = 0.0
 
@@ -5878,7 +5950,7 @@ def render_monitoraggio_portafoglio():
     with colA:
         fig = go.Figure()
         fig.add_trace(go.Bar(x=comp_cmp["Asset Class"], y=comp_cmp["Target"], name="Target", hovertemplate="%{x}<br>%{y:.1%}<extra></extra>"))
-        fig.add_trace(go.Bar(x=comp_cmp["Asset Class"], y=comp_cmp["Weight"], name="Effettivo (proxy)", hovertemplate="%{x}<br>%{y:.1%}<extra></extra>"))
+        fig.add_trace(go.Bar(x=comp_cmp["Asset Class"], y=comp_cmp["Weight"], name="Effettivo", hovertemplate="%{x}<br>%{y:.1%}<extra></extra>"))
         fig.update_layout(barmode="group", height=360, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Asset Class", yaxis_title="Peso")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -5915,7 +5987,8 @@ def render_monitoraggio_portafoglio():
                 st.markdown("**Date di revisione dell’asset allocation (cambiamenti target):** nessuna data futura.")
         else:
             st.markdown("**Date di revisione dell’asset allocation (cambiamenti target):** non disponibili.")
-        st.dataframe(comp_cmp[["Asset Class", "Target", "Weight", "Gap (Effettivo − Target)"]], use_container_width=True, hide_index=True)
+        comp_cmp_display = comp_cmp.rename(columns={"Weight": "Effettivo"})
+        st.dataframe(comp_cmp_display[["Asset Class", "Target", "Effettivo", "Gap (Effettivo − Target)"]], use_container_width=True, hide_index=True)
 
     # -----------------------------
     # 3) Performance Money Weighted
@@ -6052,7 +6125,7 @@ def render_monitoraggio_portafoglio():
                     att = pd.DataFrame({"Month": months_used, "P10": p10, "P50": p50, "P90": p90})
 
                     fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=eff["Month"], y=eff["Wealth_Effective"], mode="lines", name="Effettivo (proxy)"))
+                    fig.add_trace(go.Scatter(x=eff["Month"], y=eff["Wealth_Effective"], mode="lines", name="Effettivo"))
                     fig.add_trace(go.Scatter(x=att["Month"], y=att["P50"], mode="lines", name="Atteso (50°)"))
                     fig.add_trace(go.Scatter(x=att["Month"], y=att["P90"], mode="lines", name="Ottimistico (90°)"))
                     fig.add_trace(go.Scatter(x=att["Month"], y=att["P10"], mode="lines", name="Pessimistico (10°)"))
