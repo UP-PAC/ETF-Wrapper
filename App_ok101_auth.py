@@ -5750,7 +5750,7 @@ def render_monitoraggio_portafoglio():
     # -----------------------------
     # 1) Analisi Piano Investimenti
     # -----------------------------
-    st.markdown("## Analisi Piano Investimenti")
+    st.markdown('<div style="font-size:20px; font-weight:700; margin-top:0.75rem;">Analisi Piano Investimenti</div>', unsafe_allow_html=True)
     st.caption("Verifica di coerenza tra operazioni effettive e struttura ex‑ante (conferimenti/spese). L’inizio del monitoraggio coincide con la prima operazione.")
 
     # cashflow pianificati (investor view, annuali) -> trasformazione in mensile su base lineare
@@ -5775,24 +5775,68 @@ def render_monitoraggio_portafoglio():
     merged["Cum_Actual"] = merged["Actual_CF"].cumsum()
     merged["Delta_Cum"] = merged["Cum_Actual"] - merged["Cum_Plan"]
 
+    # riferimento temporale per analisi "ad oggi"
+    today_norm = pd.Timestamp(datetime.now().date())
+
     c1, c2 = st.columns([0.6, 0.4], gap="large")
     with c1:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=merged["Month"], y=merged["Cum_Plan"], mode="lines", name="Cumulato pianificato"))
-        fig.add_trace(go.Scatter(x=merged["Month"], y=merged["Cum_Actual"], mode="lines", name="Cumulato effettivo"))
+        merged_eff = merged[merged["Month"] <= today_norm].copy()
+        fig.add_trace(go.Scatter(x=merged["Month"], y=merged["Cum_Plan"], mode="lines", name="Cumulato pianificato", line=dict(width=2)))
+        fig.add_trace(go.Scatter(x=merged_eff["Month"], y=merged_eff["Cum_Actual"], mode="lines", name="Cumulato effettivo", line=dict(width=1)))
+        # linea verticale "oggi"
+        fig.add_vline(x=today_norm, line_color="red", line_dash="dash", line_width=1)
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Cumulato (€, segno investitore)")
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        last = merged.iloc[-1]
-        st.metric("Scostamento cumulato (Effettivo − Pianificato)", f'{last["Delta_Cum"]:,.0f}€'.replace(",", "X").replace(".", ",").replace("X", "."))
-        st.markdown("**Nota operativa**: valore positivo = l’investitore ha disinvestito/rispescato più del previsto (o ha versato meno); valore negativo = ha versato più del previsto.")
-        st.dataframe(merged.tail(12)[["Month", "Plan_CF", "Actual_CF", "Delta_Cum"]], use_container_width=True, hide_index=True)
+        # scostamento calcolato "ad oggi" (ultimo punto disponibile <= oggi)
+        _tmp = merged[merged["Month"] <= today_norm]
+        if _tmp.empty:
+            snap = merged.iloc[0]
+        else:
+            snap = _tmp.iloc[-1]
+
+        st.metric(
+            "Scostamento cumulato (Effettivo − Pianificato) – ad oggi",
+            f'{float(snap["Delta_Cum"]):,.0f}€'.replace(",", "X").replace(".", ",").replace("X", "."),
+        )
+
+        # calendario conferimenti/spese future (solo conferimenti periodici e, se GBI, spese obiettivi)
+        future_rows = []
+
+        # usa la struttura annuale ex-ante (cf_y) per costruire un calendario eventi
+        try:
+            for _, rr in cf_y.iterrows():
+                y = int(rr.get("Anno", 0))
+                dt_ev = (pd.Timestamp(start_month) + pd.DateOffset(years=y)).normalize()
+                if dt_ev <= today_norm:
+                    continue
+
+                conf = float(rr.get("Conferimenti", 0.0) or 0.0)
+                spse = float(rr.get("Spese", 0.0) or 0.0)
+
+                # escludi il conferimento iniziale (anno 0)
+                if y >= 1 and abs(conf) > 1e-9:
+                    future_rows.append({"Tipo": "Conferimento periodico", "Data": dt_ev.date(), "Importo (€)": conf})
+
+                # spese solo se presenti (GBI)
+                if abs(spse) > 1e-9:
+                    future_rows.append({"Tipo": "Spesa futura (obiettivo)", "Data": dt_ev.date(), "Importo (€)": spse})
+        except Exception:
+            future_rows = []
+
+        if future_rows:
+            cal = pd.DataFrame(future_rows).sort_values("Data")
+            st.dataframe(cal, use_container_width=True, hide_index=True)
+        else:
+            st.info("Non risultano conferimenti periodici o spese future nel periodo residuo (oppure non sono state definite ex‑ante).")
+
 
     # -----------------------------
     # 2) Analisi Composizione Portafoglio
     # -----------------------------
-    st.markdown("## Analisi Composizione Portafoglio")
+    st.markdown('<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Analisi Composizione Portafoglio</div>', unsafe_allow_html=True)
     st.caption("Confronto tra composizione effettiva (prodotti → asset class) e asset allocation target dinamica al tempo trascorso.")
 
     # costruisci esposizione per asset class su base flussi netti (proxy)
@@ -5840,6 +5884,37 @@ def render_monitoraggio_portafoglio():
 
     with colB:
         st.markdown(f"**Tempo trascorso dall’inizio investimento:** {elapsed_years} anni")
+        # Date future di revisione asset allocation (quando cambia la composizione target)
+        _start_dt = pd.to_datetime(ops_df["Date"]).min() if "Date" in ops_df.columns and not ops_df.empty else None
+        _change_years = []
+        try:
+            _prev = None
+            for _, _r in comp_df2.sort_values("Anno").iterrows():
+                if _prev is not None:
+                    _diff = False
+                    for _a in asset_cols:
+                        try:
+                            if abs(float(_r.get(_a, 0.0)) - float(_prev.get(_a, 0.0))) > 1e-9:
+                                _diff = True
+                                break
+                        except Exception:
+                            continue
+                    if _diff:
+                        _change_years.append(int(_r.get("Anno", 0)))
+                _prev = _r
+        except Exception:
+            _change_years = []
+
+        if _start_dt is not None and _change_years:
+            _change_dates = [pd.Timestamp(_start_dt).normalize() + pd.DateOffset(years=int(y)) for y in _change_years]
+            _change_dates = [d for d in _change_dates if d >= pd.Timestamp.today().normalize()]
+            if _change_dates:
+                st.markdown("**Date di revisione dell’asset allocation (cambiamenti target):**")
+                st.write("\n".join([f"- {d.date().strftime('%d/%m/%Y')}" for d in _change_dates]))
+            else:
+                st.markdown("**Date di revisione dell’asset allocation (cambiamenti target):** nessuna data futura.")
+        else:
+            st.markdown("**Date di revisione dell’asset allocation (cambiamenti target):** non disponibili.")
         st.dataframe(comp_cmp[["Asset Class", "Target", "Weight", "Gap (Effettivo − Target)"]], use_container_width=True, hide_index=True)
 
     # -----------------------------
