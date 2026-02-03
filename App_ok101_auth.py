@@ -44,6 +44,7 @@ import io
 import time
 import math
 import re
+import json
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -2896,7 +2897,7 @@ def render_analisi_portafoglio():
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        # (rimosso su richiesta) grafico principale performance MWR
     else:
         st.write("Nessun dato disponibile per il periodo selezionato.")
 
@@ -3442,6 +3443,7 @@ def render_selezione_asset_class():
             yaxis_tickformat=".0%",
             margin=dict(l=10, r=10, t=40, b=10),
         )
+        fig.add_vline(x=float(elapsed_years_now), line_width=2, line_dash='dash', line_color='red')
         st.plotly_chart(fig, use_container_width=True)
 
         # --- Composizioni ---
@@ -4474,14 +4476,66 @@ def _render_ai_products_from_portfolio(client_key: str, pid: str, payload: dict)
                                         st.plotly_chart(fig2, use_container_width=True)
     # --- Salva soluzione prodotti dentro il portafoglio
     if st.button("Salva Soluzione di Prodotti (collegata al portafoglio)", use_container_width=True, key=f"ai_save_{pid}"):
+        # 1) Verifica presenza risultati Monte Carlo (mensili) nel portafoglio in asset class
+        _mc = payload.get("monte_carlo") or payload.get("mc_last_result") or payload.get("mc") or None
+        _mc_ok = bool(_mc) and all(k in _mc for k in ["p10", "p50", "p90", "x_months"])
+        if _mc_ok:
+            try:
+                _n = len(_mc.get("p50", []))
+                _mc_ok = (_n > 0) and (len(_mc.get("p10", [])) == _n) and (len(_mc.get("p90", [])) == _n) and (len(_mc.get("x_months", [])) == _n)
+            except Exception:
+                _mc_ok = False
+
+        if not _mc_ok:
+            st.warning("Prima di Salvare, lancia la Simulazione")
+            st.stop()
+
+        # 2) Snapshot delle informazioni del portafoglio in asset class (AO o GBI)
+        _asset_inputs = payload.get("asset_inputs") or {
+            "exp_returns_ann": payload.get("exp_returns_ann"),
+            "vol_ann": payload.get("vol_ann"),
+            "corr_ann": payload.get("corr_ann"),
+        }
+
+        _portfolio_snapshot = {
+            "asset_inputs": _asset_inputs,
+            "versamenti": payload.get("versamenti"),
+            "gbi_objectives": payload.get("gbi_objectives"),
+            "composition_path": payload.get("composition_path"),
+            "life_cycle": payload.get("life_cycle"),
+            "gbi_strategy_best_row": payload.get("gbi_strategy_best_row"),
+            "gbi_best_success_prob": payload.get("gbi_best_success_prob"),
+            "gbi_success_probs_by_priority": payload.get("gbi_success_probs_by_priority"),
+            "monte_carlo": _mc,
+        }
+
+        # 3) Composizione in prodotti (nome, ISIN, peso %)
+        _products_comp = []
+        try:
+            for _it in results:
+                _ac = _it.get("asset_class")
+                for _s in _it.get("selected", []):
+                    _w = float(_s.get("weight", 0.0))
+                    _products_comp.append({
+                        "name": str(_s.get("name", "")),
+                        "isin": str(_s.get("isin", "")),
+                        "asset_class": _ac,
+                        "weight_pct": _w * 100.0,
+                    })
+        except Exception:
+            _products_comp = []
+
         payload2 = dict(payload)
         payload2["product_solution"] = {
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source_db": db.get("source_name",""),
             "mode": "dynamic" if (mode.startswith("Dinamica")) else "t0",
             "prefs": {**prefs, "notes_free_text": notes},
-            "results": results,
+            "results": results,  # dettaglio selezione per asset class
+            "linked_portfolio_snapshot": _portfolio_snapshot,
+            "products_composition": _products_comp,
         }
+
         # aggiorna storage portafogli
         st.session_state["portfolios"][pid] = payload2
         persist_portfolios_from_session()
@@ -5600,6 +5654,15 @@ def render_monitoraggio_portafoglio():
     sel_pf_label = st.selectbox("Seleziona Portafoglio salvato", pf_labels, key="mon_pf_sel")
     pid = pf_items[pf_labels.index(sel_pf_label)][0]
     payload = pf[pid]
+    # --- Tempo corrente (anni) basato sull'ultima data disponibile nelle operazioni salvate (se presenti)
+    ops_saved_preview = payload.get("monitor_ops", None)
+    ops_df_preview = pd.DataFrame(ops_saved_preview) if isinstance(ops_saved_preview, list) and len(ops_saved_preview) > 0 else pd.DataFrame()
+    if not ops_df_preview.empty and "Date" in ops_df_preview.columns:
+        try:
+            ops_df_preview["Date"] = pd.to_datetime(ops_df_preview["Date"])
+        except Exception:
+            pass
+    elapsed_years_now = _elapsed_years_from_ops(ops_df_preview) if (ops_df_preview is not None and not ops_df_preview.empty and "Date" in ops_df_preview.columns) else 0
 
     # -----------------------------
     # C) Grafici: AA dinamica + conferimenti/spese
@@ -5608,6 +5671,7 @@ def render_monitoraggio_portafoglio():
 
     comp_df = _composition_path_df(payload)
     asset_cols = [c for c in comp_df.columns if c != "Anno"]
+    # Tempo corrente già calcolato (elapsed_years_now) sulla base delle operazioni salvate, se presenti.
 
     col1, col2 = st.columns([0.55, 0.45], gap="large")
 
@@ -5625,6 +5689,12 @@ def render_monitoraggio_portafoglio():
                 name=str(a),
                 hovertemplate="%{x} anni<br>%{y:.1%}<extra></extra>"
             ))
+        # linea verticale (tempo corrente) basata sull'ultima data disponibile nelle operazioni
+        try:
+            x_now = float(max(0, min(elapsed_years_now, float(area_df["Anno"].max()))))
+            fig.add_vline(x=x_now, line_color="red", line_dash="dash", line_width=2)
+        except Exception:
+            pass
         fig.update_layout(
             height=420,
             margin=dict(l=10, r=10, t=20, b=10),
@@ -5642,6 +5712,12 @@ def render_monitoraggio_portafoglio():
         fig2.add_trace(go.Bar(x=cf["Anno"], y=cf["Conferimenti"], name="Conferimenti (−)", hovertemplate="%{x} anni<br>%{y:,.0f}€<extra></extra>"))
         if (cf["Spese"].abs().sum() > 0):
             fig2.add_trace(go.Bar(x=cf["Anno"], y=cf["Spese"], name="Spese (＋)", hovertemplate="%{x} anni<br>%{y:,.0f}€<extra></extra>"))
+        # linea verticale (tempo corrente) basata sull'ultima data disponibile nelle operazioni
+        try:
+            x_now = float(max(0, min(elapsed_years_now, float(cf["Anno"].max()))))
+            fig2.add_vline(x=x_now, line_color="red", line_dash="dash", line_width=2)
+        except Exception:
+            pass
         fig2.update_layout(
             barmode="overlay",
             height=420,
@@ -5783,8 +5859,21 @@ def render_monitoraggio_portafoglio():
     with c1:
         fig = go.Figure()
         merged_eff = merged[merged["Month"] <= today_norm].copy()
-        fig.add_trace(go.Scatter(x=merged["Month"], y=merged["Cum_Plan"], mode="lines", name="Cumulato pianificato", line=dict(width=2)))
-        fig.add_trace(go.Scatter(x=merged_eff["Month"], y=merged_eff["Cum_Actual"], mode="lines", name="Cumulato effettivo", line=dict(width=1)))
+        fig.add_trace(go.Scatter(
+            x=merged["Month"],
+            y=merged["Cum_Plan"],
+            mode="lines",
+            name="Cumulato pianificato",
+            line=dict(width=3),
+        ))
+        # "Cumulato effettivo" in verde acceso e più sottile
+        fig.add_trace(go.Scatter(
+            x=merged_eff["Month"],
+            y=merged_eff["Cum_Actual"],
+            mode="lines",
+            name="Cumulato effettivo",
+            line=dict(width=1, color="lime"),
+        ))
         # linea verticale "oggi"
         fig.add_vline(x=today_norm, line_color="red", line_dash="dash", line_width=1)
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Cumulato (€, segno investitore)")
@@ -5798,10 +5887,19 @@ def render_monitoraggio_portafoglio():
         else:
             snap = _tmp.iloc[-1]
 
-        st.metric(
-            "Scostamento cumulato (Effettivo − Pianificato) – ad oggi",
-            f'{float(snap["Delta_Cum"]):,.0f}€'.replace(",", "X").replace(".", ",").replace("X", "."),
-        )
+        delta_cum = float(snap.get("Delta_Cum", 0.0) or 0.0)
+        delta_abs_str = f"{abs(delta_cum):,.0f}€".replace(",", "X").replace(".", ",").replace("X", ".")
+        st.markdown("**Scostamento cumulato (Effettivo − Pianificato) – ad oggi**")
+        if delta_cum < -1e-9:
+            st.write(
+                f"Dall'inizio dell'investimento si è conferito (al netto delle spese eventualmente sostenute) {delta_abs_str} in più rispetto a quanto programmato"
+            )
+        elif delta_cum > 1e-9:
+            st.write(
+                f"Dall'inizio dell'investimento si è conferito (al netto delle spese eventualmente sostenute) {delta_abs_str} in meno rispetto a quanto programmato"
+            )
+        else:
+            st.write("Dall'inizio dell'investimento si è conferito (al netto delle spese eventualmente sostenute) in linea rispetto a quanto programmato")
 
         # calendario conferimenti/spese future (solo conferimenti periodici e, se GBI, spese obiettivi)
         future_rows = []
@@ -5834,7 +5932,10 @@ def render_monitoraggio_portafoglio():
             st.info("Non risultano conferimenti periodici o spese future nel periodo residuo (oppure non sono state definite ex‑ante).")
 
 
-    # -----------------------------
+    
+
+
+# -----------------------------
     # 2) Analisi Composizione Portafoglio
     # -----------------------------
     st.markdown('<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Analisi Composizione Portafoglio</div>', unsafe_allow_html=True)
@@ -6124,15 +6225,18 @@ def render_monitoraggio_portafoglio():
                     trades_df["Nuovi pesi"] = ""
                 st.markdown('<div style="font-size:0.95rem; font-weight:600; margin-top:0.25rem;">Operazioni suggerite per riallinearsi ai pesi Target</div>', unsafe_allow_html=True)
                 st.dataframe(trades_df, use_container_width=True, hide_index=True)
+                st.caption("Montante effettivo (basato su prezzi prodotti e operazioni) confrontato con montante atteso (Monte Carlo 1.000 scenari) costruito su conferimenti/spese target e asset allocation dinamica.")
+
+    import datetime as _dt
 
 
     # -----------------------------
     # 3) Performance Money Weighted
     # -----------------------------
-    st.markdown('<div style="font-size:0.95rem; font-weight:600; margin-top:0.25rem;">Performance Money Weighted</div>', unsafe_allow_html=True)
-    st.caption("Montante effettivo (basato su prezzi prodotti e operazioni) confrontato con montante atteso (Monte Carlo 1.000 scenari) costruito su conferimenti/spese target e asset allocation dinamica.")
+    st.markdown('<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Performance Money Weighted</div>', unsafe_allow_html=True)
 
-    import datetime as _dt
+
+
 
     # --- Costruisci montante effettivo da operazioni + prezzi prodotti
     ensure_product_prices_database_storage()
@@ -6230,129 +6334,151 @@ def render_monitoraggio_portafoglio():
                                 wealth = wealth.fillna(method="ffill").fillna(0.0)
                                 current_wealth = float(wealth.iloc[-1])
 
-                                # Monthly (month start) per confronto con Monte Carlo
-                                eff_monthly = wealth.resample("MS").last().to_frame("Wealth_Effective")
-                                eff_monthly = eff_monthly.reset_index().rename(columns={eff_monthly.columns[0]: "Month"})
+                                # Serie giornaliera del montante effettivo (richiesta: base giornaliera)
+                                eff_monthly = wealth.to_frame("Wealth_Effective").reset_index()
+                                # Garantisce colonne standard: Date, Wealth_Effective (robusto a index senza nome)
+                                if isinstance(eff_monthly, pd.DataFrame) and (not eff_monthly.empty):
+                                    cols = list(eff_monthly.columns)
+                                    if len(cols) >= 2:
+                                        eff_monthly = eff_monthly.iloc[:, :2].copy()
+                                        eff_monthly.columns = ["Date", "Wealth_Effective"]
+                                    elif len(cols) == 1:
+                                        eff_monthly.columns = ["Wealth_Effective"]
+    # --- Confronto con scenari Monte Carlo (opzionale)
+    # NOTA: il Database Mercati NON è necessario per disegnare il montante effettivo.
+    # Se il Database Mercati non è disponibile (o non ha osservazioni nella finestra), mostriamo comunque il montante effettivo.
+    
+    # (Grafico rimosso su richiesta: Montante portafoglio + Conferimenti cumulati)
+    has_eff = (eff_monthly is not None) and isinstance(eff_monthly, pd.DataFrame) and (not eff_monthly.empty)
+    if has_eff:
+        st.markdown(f"**Montante alla data odierna:** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+        # -------------------------------------------------------------
+        # Grafico aggiuntivo: Montanti Atteso / Ottimistico / Pessimistico
+        # (dalla soluzione in Asset Class associata al portafoglio)
+        # -------------------------------------------------------------
+        _mc = payload.get("monte_carlo") or payload.get("mc_last_result") or payload.get("mc") or None
+        # fallback: snapshot collegato (usato in alcune sezioni)
+        try:
+            if _mc is None and isinstance(payload.get("linked_portfolio_snapshot", None), dict):
+                _mc = payload["linked_portfolio_snapshot"].get("monte_carlo") or payload["linked_portfolio_snapshot"].get("mc_last_result") or payload["linked_portfolio_snapshot"].get("mc")
+        except Exception:
+            pass
 
-    # --- Scenario atteso (Monte Carlo 1.000) su flussi target e AA dinamica (asset class)
-    mdb = st.session_state.get("market_database", None)
-    if eff_monthly is None or eff_monthly.empty:
-        st.info("Montante effettivo non disponibile: verrà mostrato solo lo scenario atteso (se disponibile).")
-    if not isinstance(mdb, dict) or not isinstance(mdb.get("df"), pd.DataFrame) or mdb["df"].empty:
-        if eff_monthly is not None and not eff_monthly.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=eff_monthly["Month"], y=eff_monthly["Wealth_Effective"], mode="lines", name="Effettivo"))
-            fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Montante (€)")
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown(f"**Montante alla data odierna:** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
-        else:
-            st.warning("Database Mercati non disponibile: impossibile stimare il montante atteso (Monte Carlo).")
-    else:
-        dfm = mdb["df"].copy()
-        # individua colonna data
-        date_col = None
-        for c in dfm.columns:
-            if str(c).lower().strip() in ["date", "data"]:
-                date_col = c
-                break
-        if date_col is None:
-            st.warning("Database Mercati: colonna data non trovata.")
-        else:
-            dfm[date_col] = pd.to_datetime(dfm[date_col], errors="coerce")
-            dfm = dfm.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
-            dfm["Month"] = dfm[date_col].dt.to_period("M").dt.to_timestamp()
+        _mc_ok = bool(_mc) and isinstance(_mc, dict) and all(k in _mc for k in ["p10", "p50", "p90", "x_months"])
+        if _mc_ok:
+            try:
+                _x = _mc.get("x_months", [])
+                _p10 = _mc.get("p10", [])
+                _p50 = _mc.get("p50", [])
+                _p90 = _mc.get("p90", [])
+                _n = len(_p50) if isinstance(_p50, (list, tuple)) else 0
+                _mc_ok = (
+                    _n > 1
+                    and isinstance(_x, (list, tuple)) and len(_x) == _n
+                    and isinstance(_p10, (list, tuple)) and len(_p10) == _n
+                    and isinstance(_p90, (list, tuple)) and len(_p90) == _n
+                )
+            except Exception:
+                _mc_ok = False
 
-            # asset class da usare: quelle presenti nella AA dinamica e nel db mercati
-            assets_use = [a for a in asset_cols if a in dfm.columns]
-            if not assets_use:
-                st.warning("Nessuna asset class del portafoglio è presente nel Database Mercati: impossibile Monte Carlo.")
-            else:
-                # rendimenti mensili disponibili
-                R = dfm[["Month"] + assets_use].copy()
-                for a in assets_use:
-                    R[a] = pd.to_numeric(R[a], errors="coerce").fillna(0.0).clip(lower=-0.9999)
+        if _mc_ok:
+            try:
+                # --- Asse X in anni: supporta sia mesi numerici (0..N) sia stringhe 'YYYY-MM' ---
+                _x = list(_mc.get("x_months", []))
 
-                # limita finestra: dalla data start_month (inizio monitoraggio) fino a oggi
-                R = R[(R["Month"] >= start_month) & (R["Month"] <= pd.Timestamp(_dt.date.today()).to_period("M").to_timestamp())].copy()
-                if R.empty:
-                    st.warning("Database Mercati: nessuna osservazione nel periodo di monitoraggio.")
-                else:
-                    months_used = R["Month"].tolist()
-                    months_fwd = len(months_used)
+                x_years = None
 
-                    # --- Scenario atteso MC (1.000): usa media/vol/corr dai rendimenti storici della finestra
-                    hist = R[assets_use].copy()
-                    mu_m = hist.mean().values
-                    cov_m = hist.cov().values
-                    cov_m = cov_m + np.eye(cov_m.shape[0]) * 1e-10
+                # Caso 1: mesi numerici
+                try:
+                    _x_num = pd.to_numeric(pd.Series(_x), errors="coerce")
+                    if _x_num.notna().all():
+                        x_years = (_x_num.astype(float) / 12.0).tolist()
+                except Exception:
+                    x_years = None
 
-                    scen = 1000
-                    rng = np.random.default_rng(12345)
-                    Z = rng.standard_normal(size=(scen * months_fwd, len(assets_use)))
-                    try:
-                        L = np.linalg.cholesky(cov_m)
-                    except np.linalg.LinAlgError:
-                        L = np.linalg.cholesky(cov_m + np.eye(cov_m.shape[0]) * 1e-8)
-                    X = Z @ L.T
-                    sim = (X + mu_m).reshape(scen, months_fwd, len(assets_use))
+                # Caso 2: stringhe tipo YYYY-MM (o date)
+                if x_years is None:
+                    _x_str = [str(v) for v in _x]
+                    _x_dt = pd.to_datetime(
+                        [f"{s}-01" if len(s) == 7 and s[4] == "-" else s for s in _x_str],
+                        errors="coerce"
+                    )
+                    if _x_dt.notna().all():
+                        base = _x_dt.iloc[0] if hasattr(_x_dt, "iloc") else _x_dt[0]
+                        # differenza in mesi rispetto alla base, poi /12
+                        months = [(d.year * 12 + d.month) - (base.year * 12 + base.month) for d in _x_dt]
+                        x_years = [m / 12.0 for m in months]
 
-                    # dinamica pesi mensili (da comp_df): usa peso anno floor(t/12)
-                    w_df = comp_df.copy().sort_values("Anno").reset_index(drop=True)
-                    def _w_for_month_idx(mi: int) -> np.ndarray:
-                        y = int(mi // 12)
-                        if (w_df["Anno"] >= y).any():
-                            r = w_df[w_df["Anno"] >= y].iloc[0]
-                        else:
-                            r = w_df.iloc[-1]
-                        w = np.array([float(r.get(a, 0.0)) for a in assets_use], dtype=float)
-                        s = w.sum()
-                        return w/s if s>0 else np.full_like(w, 1.0/len(w))
+                if x_years is None:
+                    raise ValueError("Asse X Monte Carlo non interpretabile")
 
-                    # cashflows pianificati (portfolio sign): conferimenti +, spese -
-                    plan_cf_port = np.zeros(months_fwd, dtype=float)
-                    for _, r in cf_y.iterrows():
-                        y = int(r["Anno"])
-                        mi = 12 * y
-                        if 0 <= mi < months_fwd:
-                            plan_cf_port[mi] += -(float(r["Conferimenti"]))  # conferimenti -> +
-                            plan_cf_port[mi] -= float(r["Spese"])          # spese -> -
+                p10 = pd.to_numeric(pd.Series(_mc.get("p10", [])), errors="coerce").astype(float).tolist()
+                p50 = pd.to_numeric(pd.Series(_mc.get("p50", [])), errors="coerce").astype(float).tolist()
+                p90 = pd.to_numeric(pd.Series(_mc.get("p90", [])), errors="coerce").astype(float).tolist()
 
-                    # Simula ricchezza
-                    W = np.zeros((scen, months_fwd), dtype=float)
-                    for s in range(scen):
-                        wealth_s = 0.0
-                        for mi in range(months_fwd):
-                            wealth_s += float(plan_cf_port[mi])
-                            w = _w_for_month_idx(mi)
-                            r_p = float(np.dot(w, sim[s, mi, :]))
-                            wealth_s = max(0.0, wealth_s * (1.0 + r_p))
-                            W[s, mi] = wealth_s
+                if not (len(x_years) == len(p10) == len(p50) == len(p90)):
+                    raise ValueError("Lunghezze non coerenti")
 
-                    p10 = np.percentile(W, 10, axis=0)
-                    p50 = np.percentile(W, 50, axis=0)
-                    p90 = np.percentile(W, 90, axis=0)
-                    att = pd.DataFrame({"Month": months_used, "P10": p10, "P50": p50, "P90": p90})
-
-                    # Allinea effettivo ai mesi usati (se disponibile)
-                    fig = go.Figure()
-                    if eff_monthly is not None and not eff_monthly.empty:
-                        eff_plot = eff_monthly.copy()
-                        eff_plot["Month"] = pd.to_datetime(eff_plot["Month"])
-                        # reindex su months_used
-                        eff_plot = eff_plot.set_index("Month").reindex(pd.to_datetime(months_used)).ffill().reset_index().rename(columns={"index":"Month"})
-                        fig.add_trace(go.Scatter(x=eff_plot["Month"], y=eff_plot["Wealth_Effective"], mode="lines", name="Effettivo"))
-                    fig.add_trace(go.Scatter(x=att["Month"], y=att["P50"], mode="lines", name="Atteso (50°)"))
-                    fig.add_trace(go.Scatter(x=att["Month"], y=att["P90"], mode="lines", name="Ottimistico (90°)"))
-                    fig.add_trace(go.Scatter(x=att["Month"], y=att["P10"], mode="lines", name="Pessimistico (10°)"))
-                    fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Data", yaxis_title="Montante (€)")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    if eff_monthly is not None and not eff_monthly.empty:
-                        st.markdown(f"**Montante alla data odierna:** {current_wealth:,.0f}€".replace(",", "X").replace(".", ",").replace("X", "."))
+                fig_mc = go.Figure()
+                # Linea: montante effettivo del portafoglio in prodotti (stesso "Montante portafoglio" del grafico sopra)
+                try:
+                    if "eff_monthly" in locals():
+                        _em = eff_monthly
+                        _has_eff = (_em is not None) and isinstance(_em, pd.DataFrame) and (not _em.empty) and ("Wealth_Effective" in _em.columns) and ("Date" in _em.columns)
                     else:
-                        st.info("Montante effettivo non disponibile: mostrato solo lo scenario atteso.")
+                        _has_eff = False
+                    if _has_eff:
+                        # Base temporale: se l’asse Monte Carlo è interpretabile come date (YYYY-MM), allinea al primo mese MC; altrimenti usa la prima data effettiva
+                        _x_str2 = [str(v) for v in _x]
+                        _x_dt2 = pd.to_datetime(
+                            [f"{s}-01" if len(s) == 7 and s[4] == "-" else s for s in _x_str2],
+                            errors="coerce"
+                        )
+                        _base = pd.to_datetime(_em["Date"].min())
+                        _eff_years = ((pd.to_datetime(_em["Date"]) - _base).dt.days / 365.25).astype(float).tolist()
+                        fig_mc.add_trace(go.Scatter(
+                            x=_eff_years,
+                            y=pd.to_numeric(_em["Wealth_Effective"], errors="coerce").astype(float),
+                            mode="lines",
+                            name="Montante portafoglio",
+                            hovertemplate="Anno %{x:.2f}<br>%{y:,.0f}€<extra></extra>",
+                        ))
+                except Exception:
+                    pass
+                fig_mc.add_trace(go.Scatter(
+                    x=x_years, y=p50, mode="lines",
+                    name="Atteso (50° percentile)",
+                    hovertemplate="Anno %{x:.1f}<br>%{y:,.0f}€<extra></extra>",
+                ))
+                fig_mc.add_trace(go.Scatter(
+                    x=x_years, y=p90, mode="lines",
+                    name="Ottimistico (90° percentile)",
+                    hovertemplate="Anno %{x:.1f}<br>%{y:,.0f}€<extra></extra>",
+                    line=dict(color="green")
+                ))
+                fig_mc.add_trace(go.Scatter(
+                    x=x_years, y=p10, mode="lines",
+                    name="Pessimistico (10° percentile)",
+                    hovertemplate="Anno %{x:.1f}<br>%{y:,.0f}€<extra></extra>",
+                    line=dict(color="red")
+                ))
 
-    # -----------------------------
+                fig_mc.update_layout(
+                    height=320,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    xaxis_title="Anni",
+                    yaxis_title="Montante (€)",
+                    legend_title_text="Proiezioni Monte Carlo",
+                )
+
+                st.plotly_chart(fig_mc, use_container_width=True)
+            except Exception:
+                st.warning("Impossibile mostrare il grafico dei montanti (Atteso/Ottimistico/Pessimistico): dati Monte Carlo non coerenti.")
+        else:
+            st.info("Per mostrare i montanti Atteso/Ottimistico/Pessimistico è necessario che il portafoglio abbia una simulazione Monte Carlo salvata (sezione Crea Soluzione di Investimento → Asset Class).")
+
+    else:
+        st.warning("Impossibile generare il grafico: servono Operazioni + Database Prezzi Prodotti (Serie Storiche Prodotti).")
     # 4) (GBI) Stima Probabilità di S di Successo
     # -----------------------------
     if bool(payload.get("gbi", False)):
@@ -6528,60 +6654,11 @@ def render_monitoraggio_portafoglio():
             unsafe_allow_html=True
         )
 
-    # -----------------------------
-    # 6) Modifica Selezione Prodotti
-    # -----------------------------
-    st.markdown("## Modifica Selezione Prodotti")
-    st.caption("Confronto composizione in prodotti (proxy) e asset allocation corrente; calcolo delle modifiche per riallineamento (per asset class).")
-
-    # target corrente: anno elapsed
-    elapsed_years = _elapsed_years_from_ops(ops_df)
-    comp_df2 = comp_df.sort_values("Anno")
-    if (comp_df2["Anno"] >= elapsed_years).any():
-        tr = comp_df2[comp_df2["Anno"] >= elapsed_years].iloc[0]
-    else:
-        tr = comp_df2.iloc[-1]
-    target_now = {a: float(tr.get(a, 0.0)) for a in [c for c in comp_df2.columns if c != "Anno"]}
-    s = sum(target_now.values())
-    if s > 0:
-        target_now = {k: v/s for k, v in target_now.items()}
-
-    # effettivo: ac_values (Value)
-    eff_now = {row["Asset Class"]: float(row["Value"]) for _, row in ac_values.iterrows()}
-    total_now = float(sum(eff_now.values()) or 0.0)
-    if total_now <= 0:
-        st.info("Valore totale effettivo non disponibile: impossibile calcolare suggerimenti di riallocazione.")
-        return
-
-    # suggerimenti: delta valore per asset class
-    recs = []
-    for ac, tw in target_now.items():
-        target_val = tw * total_now
-        curr_val = eff_now.get(ac, 0.0)
-        recs.append({"Asset Class": ac, "Valore attuale (proxy)": curr_val, "Valore target": target_val, "Delta (target−attuale)": target_val - curr_val})
-    df_reb = pd.DataFrame(recs).sort_values("Delta (target−attuale)", ascending=False)
-    st.dataframe(df_reb, use_container_width=True, hide_index=True)
-
-    if st.button("Rialloca", use_container_width=True, key="mon_rebalance_btn"):
-        st.markdown("### Indicazioni operative (per asset class)")
-        buys = df_reb[df_reb["Delta (target−attuale)"] > 0].copy()
-        sells = df_reb[df_reb["Delta (target−attuale)"] < 0].copy()
-
-        if buys.empty and sells.empty:
-            st.success("Il portafoglio risulta già allineato (entro la precisione del proxy).")
-        else:
-            if not sells.empty:
-                st.markdown("**Da ridurre / vendere**")
-                tmp = sells.copy()
-                tmp["Importo stimato"] = (-tmp["Delta (target−attuale)"])
-                st.dataframe(tmp[["Asset Class", "Importo stimato"]], use_container_width=True, hide_index=True)
-            if not buys.empty:
-                st.markdown("**Da incrementare / acquistare**")
-                tmp = buys.copy()
-                tmp["Importo stimato"] = tmp["Delta (target−attuale)"]
-                st.dataframe(tmp[["Asset Class", "Importo stimato"]], use_container_width=True, hide_index=True)
 
 # =======================
+# Crea Soluzione di Investimento → Asset-Only
+# =======================
+
 def render_crea_portafoglio():
     ensure_anagrafica_storage()
     ensure_portfolio_storage()
@@ -7698,10 +7775,54 @@ def render_crea_portafoglio():
         st.session_state["mc_last_table"] = df_tbl_fmt
         st.session_state["mc_chart_uid"] = f"mc_chart_{datetime.now().strftime('%H%M%S%f')}"
 
+        # Salvo anche le curve percentili (raw) e una "firma" degli input per collegare
+        # i risultati Monte Carlo al set di parametri corrente (utile in fase di salvataggio).
+        try:
+            _mc_sig_payload = {
+                "horizon_years": int(H),
+                "initial_amount": float(initial_amount),
+                "periodic_amount": float(periodic_amount),
+                "periodic_freq": str(freq),
+                "periodic_years": int(periodic_years_int),
+                "asset_names": list(asset_names_sel),
+                "mu_ann": [float(x) for x in np.asarray(mu_ann).ravel().tolist()],
+                "sig_ann": [float(x) for x in np.asarray(sig_ann).ravel().tolist()],
+                "rho": np.asarray(rho).round(10).tolist(),
+                "year_weights": np.asarray(year_weights).round(10).tolist(),
+            }
+            _mc_sig = hashlib.sha256(json.dumps(_mc_sig_payload, sort_keys=True).encode("utf-8")).hexdigest()
+        except Exception:
+            _mc_sig = None
+            _mc_sig_payload = None
+
+        
+        # Build monthly time grid aligned to Monte Carlo paths (p10/p50/p90)
+        _n_months = int(len(np.asarray(p50).ravel()))
+        _start_date = pd.Timestamp.today().to_period("M").to_timestamp()  # month start
+        _months_used = pd.date_range(start=_start_date, periods=_n_months, freq="MS")
+        _x_months = [d.strftime("%Y-%m") for d in _months_used]
+        _x_month_index = list(range(_n_months))
+        _x_years = [i / 12.0 for i in range(_n_months)]
+
+        st.session_state["mc_last_result"] = {
+            "x_months": _x_months,
+            "x_month_index": _x_month_index,
+            "x_years": _x_years,
+            "p10": [float(v) for v in np.asarray(p10).ravel().tolist()],
+            "p50": [float(v) for v in np.asarray(p50).ravel().tolist()],
+            "p90": [float(v) for v in np.asarray(p90).ravel().tolist()],
+            "contrib_monthly": [float(v) for v in np.asarray(contrib).ravel().tolist()],
+            "cum_contrib_monthly": [float(v) for v in np.asarray(cum_contrib).ravel().tolist()],
+            "n_sims": int(n_sims),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        st.session_state["mc_last_sig"] = _mc_sig
+        st.session_state["mc_last_sig_payload"] = _mc_sig_payload
+
         # reset trigger e rerun per rendere subito il grafico
         st.session_state["mc_trigger"] = False
         st.rerun()
-# -----------------------
+    # -----------------------
     if "mc_last_fig" in st.session_state:
         fig = st.session_state["mc_last_fig"]
         uid = st.session_state.get("mc_chart_uid", "mc_chart")
@@ -7771,10 +7892,63 @@ def render_crea_portafoglio():
         life_cycle_info = {"enabled": False}
 
     if st.button("Salva Portafoglio", type="primary", key="pf_save_btn"):
-        # consento salvataggio anche se nome vuoto? (qui richiediamo almeno un nome)
-        if portfolio_name == "":
+        # Il salvataggio richiede che la simulazione Monte Carlo sia stata eseguita,
+        # così da poter memorizzare anche i percorsi Atteso/Pessimistico/Ottimistico.
+        mc_res = st.session_state.get("mc_last_result", None)
+        mc_sig_saved = st.session_state.get("mc_last_sig", None)
+
+        # Calcolo una firma degli input correnti per verificare coerenza con l'ultima simulazione
+        try:
+            _asset_names_now = list(asset_names_sel) if "asset_names_sel" in locals() else []
+            _mu_ann_now = (
+                [float(x) for x in np.asarray(pd.Series(exp_ret_sel, index=_asset_names_now).astype(float).values).ravel().tolist()]
+                if exp_ret_sel is not None and _asset_names_now else None
+            )
+            _sig_ann_now = (
+                [float(x) for x in np.asarray(pd.Series(vol_sel, index=_asset_names_now).astype(float).values).ravel().tolist()]
+                if vol_sel is not None and _asset_names_now else None
+            )
+            _rho_now = (
+                np.asarray(pd.DataFrame(corr_sel, index=_asset_names_now, columns=_asset_names_now).astype(float).values).round(10).tolist()
+                if corr_sel is not None and _asset_names_now else None
+            )
+            _yw_now = np.asarray(year_weights).round(10).tolist() if "year_weights" in locals() else None
+
+            _mc_sig_payload_now = {
+                "horizon_years": int(horizon_years),
+                "initial_amount": float(initial_amount),
+                "periodic_amount": float(periodic_amount),
+                "periodic_freq": str(freq),
+                "periodic_years": int(periodic_years),
+                "asset_names": _asset_names_now,
+                "mu_ann": _mu_ann_now,
+                "sig_ann": _sig_ann_now,
+                "rho": _rho_now,
+                "year_weights": _yw_now,
+            }
+            _mc_sig_now = hashlib.sha256(json.dumps(_mc_sig_payload_now, sort_keys=True).encode("utf-8")).hexdigest()
+        except Exception:
+            _mc_sig_now = None
+
+        def _mc_has_monthly_paths(_mc: dict | None) -> bool:
+            try:
+                if not isinstance(_mc, dict):
+                    return False
+                required = ("p10", "p50", "p90", "x_months")
+                if not all(k in _mc for k in required):
+                    return False
+                p50_ = _mc.get("p50", [])
+                xm_ = _mc.get("x_months", [])
+                return (len(p50_) > 0) and (len(xm_) == len(p50_))
+            except Exception:
+                return False
+
+        if not _mc_has_monthly_paths(mc_res):
+            st.warning("Prima di Salvare, lancia la Simulazione")
+        elif portfolio_name == "":
             st.error("Inserire un Nome per il Portafoglio prima di salvare.")
         else:
+            # ID portafoglio
             if is_reform:
                 pid = str(reform_ctx.get("pid"))
             else:
@@ -7784,6 +7958,58 @@ def render_crea_portafoglio():
                 while pid in st.session_state["portfolios"]:
                     pid = f"{base_id} ({k})"
                     k += 1
+
+            # Rendimenti attesi / volatilità / correlazioni (annuali) delle asset class selezionate
+            exp_ret_payload = None
+            vol_payload = None
+            corr_payload = None
+            try:
+                exp_ret_payload = {n: float(pd.Series(exp_ret_sel, index=_asset_names_now).astype(float).loc[n]) for n in _asset_names_now}
+            except Exception:
+                exp_ret_payload = exp_ret_sel
+            try:
+                vol_payload = {n: float(pd.Series(vol_sel, index=_asset_names_now).astype(float).loc[n]) for n in _asset_names_now}
+            except Exception:
+                vol_payload = vol_sel
+            try:
+                corr_df = pd.DataFrame(corr_sel, index=_asset_names_now, columns=_asset_names_now).astype(float)
+                corr_payload = corr_df.round(10).to_dict(orient="index")
+            except Exception:
+                corr_payload = corr_sel
+
+            # Struttura completa dei versamenti (tempi e importi)
+            versamenti = []
+            try:
+                months_per_year = 12
+                n_steps = int(int(horizon_years) * months_per_year)
+                contrib = np.zeros(n_steps + 1, dtype=float)
+                contrib[0] = float(initial_amount)
+
+                step_map_m = {"Mensile": 1, "Trimestrale": 3, "Semestrale": 6, "Annuale": 12}
+                step_k_m = int(step_map_m.get(freq, 1))
+                pay_months = int(int(periodic_years) * 12)
+
+                if float(periodic_amount) > 0 and pay_months > 0:
+                    for t in range(1, min(n_steps, pay_months) + 1):
+                        if (t % step_k_m) == 0:
+                            contrib[t] = float(periodic_amount)
+
+                for t, amt in enumerate(contrib.tolist()):
+                    if amt == 0:
+                        continue
+                    # t=0 è "Conferimento iniziale"; t>=1 sono versamenti periodici
+                    if t == 0:
+                        versamenti.append({"t_month": 0, "anno": 0, "mese_nell_anno": 0, "tipo": "Conferimento iniziale", "importo": float(amt)})
+                    else:
+                        versamenti.append({
+                            "t_month": int(t),
+                            "anno": int((t - 1) // 12) + 1,
+                            "mese_nell_anno": int((t - 1) % 12) + 1,
+                            "tipo": "Versamento periodico",
+                            "importo": float(amt),
+                        })
+            except Exception:
+                versamenti = None
 
             payload = {
                 "id": pid,
@@ -7797,16 +8023,33 @@ def render_crea_portafoglio():
                 "periodic_years": int(periodic_years),
                 "equity_weight_pct": int(eq_w),
                 "asset_selection": sel_as,
+
+                # (a) attesi / vol / corr delle asset class
+                "exp_returns_ann": exp_ret_payload,
+                "vol_ann": vol_payload,
+                "corr_ann": corr_payload,
+
+                # (b) composizione (statica + dinamica, incl. Life Cycle)
                 "composition": w,
                 "composition_path": composition_path_records,
                 "life_cycle": life_cycle_info,
+
+                # (c) struttura versamenti (tempi + importi)
+                "versamenti": versamenti,
+
+                # (d) percorsi Monte Carlo: p10/p50/p90 e griglia temporale (anni)
+                "monte_carlo": mc_res,
+
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
+
             st.session_state["portfolios"][pid] = payload
             st.session_state["client_portfolios"].setdefault(client_key, [])
             if pid not in st.session_state["client_portfolios"][client_key]:
                 st.session_state["client_portfolios"][client_key].append(pid)
+
             st.success(f'Portafoglio "{portfolio_name}" salvato correttamente per il cliente selezionato.')
+
     persist_portfolios_from_session()
     persist_client_grids_from_session()
 
@@ -8730,6 +8973,9 @@ def render_crea_soluzione_gbi():
         mu_ann_assets = np.asarray(pd.Series(exp_ret, index=asset_names).astype(float).values)  # rendimento atteso annuo (aritmetico)
         sig_ann_assets = np.asarray(pd.Series(vol, index=asset_names).astype(float).values)     # volatilità annua
         rho_assets = np.asarray(pd.DataFrame(corr, index=asset_names, columns=asset_names).astype(float).values)
+        st.session_state["gbi_mu_ann_assets"] = mu_ann_assets.tolist()
+        st.session_state["gbi_sig_ann_assets"] = sig_ann_assets.tolist()
+        st.session_state["gbi_rho_assets"] = rho_assets.tolist()
 
         # Matrice pesi dei portafogli selezionati (righe = portafogli; colonne = asset class)
         W_sel_raw = alloc_df.loc[selected_pf, asset_names].values.astype(float)
@@ -8963,6 +9209,18 @@ def render_crea_soluzione_gbi():
     # --- Costruzione cashflow mensili ---
     objectives_all = st.session_state.get("gbi_objectives", [])
     cash_in = _build_monthly_contributions(T_years, freq, float(periodic_amount), int(periodic_years_int))
+    # Costruisco struttura versamenti (mensile) per salvataggio
+    _start_m = pd.Timestamp.today().normalize().replace(day=1)
+    _months = pd.date_range(start=_start_m, periods=int(T_years * 12), freq="MS")
+    versamenti = []
+    if float(initial_amount) > 0:
+        versamenti.append({"month_index": 0, "year": int(0), "month_in_year": 1, "date": _months[0].strftime("%Y-%m"), "type": "Conferimento iniziale", "amount": float(initial_amount)})
+    for i, amt in enumerate(np.asarray(cash_in, dtype=float).reshape(-1)):
+        if amt > 0:
+            y = int(i // 12)
+            m_in_y = int(i % 12) + 1
+            versamenti.append({"month_index": int(i), "year": y, "month_in_year": m_in_y, "date": _months[i].strftime("%Y-%m"), "type": "Versamento periodico", "amount": float(amt)})
+    st.session_state["gbi_versamenti"] = versamenti
     cash_out_all = _build_monthly_outflows_from_objectives(objectives_all, T_years, upto_priority=None)
     initial_cap = float(initial_amount)
 
@@ -9450,6 +9708,7 @@ def render_crea_soluzione_gbi():
                         # Tabella di riepilogo (senza immagini)
                         df_pr = pd.DataFrame(rows_pr)
                         st.dataframe(df_pr.style.format({"Probabilità di successo": "{:.1%}"}), use_container_width=True)
+                        st.session_state["gbi_success_probs_by_priority"] = rows_pr
                         # -----------------------
                         # Traiettorie del montante (strategia ottima) – 250 scenari + percentili 10/50/90
                         # -----------------------
@@ -9486,7 +9745,19 @@ def render_crea_soluzione_gbi():
                             p10 = np.percentile(paths_w, 10, axis=0)
                             p50 = np.percentile(paths_w, 50, axis=0)
                             p90 = np.percentile(paths_w, 90, axis=0)
-                        
+
+                            # Salvo percentili e griglia temporale mensile in sessione (per salvataggio soluzione)
+                            _start_m = pd.Timestamp.today().normalize().replace(day=1)
+                            _months = pd.date_range(start=_start_m, periods=int(M_months + 1), freq="MS")
+                            st.session_state["gbi_mc_last_result"] = {
+                                "x_months": [d.strftime("%Y-%m") for d in _months],
+                                "x_month_index": list(range(int(M_months + 1))),
+                                "x_years": [i / 12 for i in range(int(M_months + 1))],
+                                "p10": p10.tolist(),
+                                "p50": p50.tolist(),
+                                "p90": p90.tolist(),
+                            }
+
                             # Seleziono 250 traiettorie per visualizzazione
                             n_show = min(250, S_total)
                             rng_show = np.random.default_rng(12345)
@@ -9635,6 +9906,12 @@ def render_crea_soluzione_gbi():
             if (best_ga is None) or (best_ga.get("best_row") is None) or (best_ga.get("best_fit") is None):
                 st.error("Eseguire prima l’Algoritmo Genetico per generare una soluzione dinamica.")
             else:
+                # Richiedo che esista anche una simulazione Monte Carlo (percentili 10/50/90) per il salvataggio
+                mc_res = st.session_state.get("gbi_mc_last_result", None)
+                if (mc_res is None) or (mc_res.get("p50") is None) or (mc_res.get("x_months") is None):
+                    st.warning("Prima di Salvare, lancia la Simulazione")
+                    st.stop()
+
                 best_row_to_save = best_ga.get("best_row")
                 best_fit_to_save = best_ga.get("best_fit")
 
@@ -9694,7 +9971,20 @@ def render_crea_soluzione_gbi():
                     "gbi_best_success_prob": float(best_fit_to_save),
                     "gbi_asset_selection": selected_set_name,
                     "composition": comp_w0,
-                    "composition_path": comp_path_records,
+                                        # input mercati (asset class) per la soluzione GBI
+                    "asset_inputs": {
+                        "asset_names": list(st.session_state.get("gbi_asset_names", [])),
+                        "exp_returns_ann": (np.asarray(st.session_state.get("gbi_mu_ann_assets", []), dtype=float).reshape(-1).tolist() if "gbi_mu_ann_assets" in st.session_state else None),
+                        "vol_ann": (np.asarray(st.session_state.get("gbi_sig_ann_assets", []), dtype=float).reshape(-1).tolist() if "gbi_sig_ann_assets" in st.session_state else None),
+                        "corr_ann": (np.asarray(st.session_state.get("gbi_rho_assets", []), dtype=float).tolist() if "gbi_rho_assets" in st.session_state else None),
+                    },
+                    # struttura versamenti con tempi (mensile)
+                    "versamenti": st.session_state.get("gbi_versamenti", None),
+                    # probabilità di successo per obiettivi cumulati (priorità)
+                    "gbi_success_probs_by_priority": st.session_state.get("gbi_success_probs_by_priority", None),
+                    # risultati Monte Carlo (percentili) con frequenza mensile
+                    "monte_carlo": st.session_state.get("gbi_mc_last_result", None),
+"composition_path": comp_path_records,
                 }
 
                 st.session_state.setdefault("portfolios", {})
