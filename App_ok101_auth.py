@@ -3443,7 +3443,7 @@ def render_selezione_asset_class():
             yaxis_tickformat=".0%",
             margin=dict(l=10, r=10, t=40, b=10),
         )
-        fig.add_vline(x=float(elapsed_years_now), line_width=2, line_dash='dash', line_color='red')
+        # (Fix) Rimossa vline: variabile non definita in questa sezione e non pertinente all'asse X (rischio).
         st.plotly_chart(fig, use_container_width=True)
 
         # --- Composizioni ---
@@ -5664,6 +5664,24 @@ def render_monitoraggio_portafoglio():
             pass
     elapsed_years_now = _elapsed_years_from_ops(ops_df_preview) if (ops_df_preview is not None and not ops_df_preview.empty and "Date" in ops_df_preview.columns) else 0
 
+    # Tempo di riferimento per la linea rossa tratteggiata:
+    # deve rappresentare il tempo trascorso dalla prima operazione fino all'ultima data disponibile nel Database Prezzi Prodotti.
+    elapsed_years_ref = elapsed_years_now
+    try:
+        start_dt_ops = None
+        if ops_df_preview is not None and not ops_df_preview.empty and "Date" in ops_df_preview.columns:
+            start_dt_ops = pd.to_datetime(ops_df_preview["Date"], errors="coerce").min()
+        pp_payload = st.session_state.get("product_prices_database", None)
+        pp_df = pp_payload.get("df") if isinstance(pp_payload, dict) else None
+        last_price_dt = None
+        if pp_df is not None and isinstance(pp_df, pd.DataFrame) and (not pp_df.empty) and pp_df.shape[1] >= 1:
+            date_col = pp_df.columns[0]
+            last_price_dt = pd.to_datetime(pp_df[date_col], errors="coerce").max()
+        if (start_dt_ops is not None) and pd.notna(start_dt_ops) and (last_price_dt is not None) and pd.notna(last_price_dt) and (last_price_dt >= start_dt_ops):
+            elapsed_years_ref = float((last_price_dt - start_dt_ops).days) / 365.25
+    except Exception:
+        elapsed_years_ref = elapsed_years_now
+
     # -----------------------------
     # C) Grafici: AA dinamica + conferimenti/spese
     # -----------------------------
@@ -5691,7 +5709,7 @@ def render_monitoraggio_portafoglio():
             ))
         # linea verticale (tempo corrente) basata sull'ultima data disponibile nelle operazioni
         try:
-            x_now = float(max(0, min(elapsed_years_now, float(area_df["Anno"].max()))))
+            x_now = float(max(0, min(elapsed_years_ref, float(area_df["Anno"].max()))))
             fig.add_vline(x=x_now, line_color="red", line_dash="dash", line_width=2)
         except Exception:
             pass
@@ -5714,7 +5732,7 @@ def render_monitoraggio_portafoglio():
             fig2.add_trace(go.Bar(x=cf["Anno"], y=cf["Spese"], name="Spese (＋)", hovertemplate="%{x} anni<br>%{y:,.0f}€<extra></extra>"))
         # linea verticale (tempo corrente) basata sull'ultima data disponibile nelle operazioni
         try:
-            x_now = float(max(0, min(elapsed_years_now, float(cf["Anno"].max()))))
+            x_now = float(max(0, min(elapsed_years_ref, float(cf["Anno"].max()))))
             fig2.add_vline(x=x_now, line_color="red", line_dash="dash", line_width=2)
         except Exception:
             pass
