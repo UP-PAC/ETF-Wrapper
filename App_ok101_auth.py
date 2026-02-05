@@ -5374,7 +5374,6 @@ def render_monitoraggio_portafoglio():
     - Analisi Piano Investimenti (coerenza flussi)
     - Analisi Composizione Portafoglio (prodotti -> asset class vs target dinamico)
     - Performance Money Weighted (montante effettivo vs atteso MC, in forma operativa)
-    - (GBI) Stima Probabilità di Successo
     - (GBI) Riformula Portafoglio GBI (via redirect alla sezione GBI con contesto)
     - Modifica Selezione Prodotti (riallocazione suggerita)
     """
@@ -5816,7 +5815,23 @@ def render_monitoraggio_portafoglio():
     # -----------------------------
     st.markdown('<div class="uw-card"><h3>Monitoraggio</h3></div>', unsafe_allow_html=True)
 
-    # Preparazioni comuni
+    # Raccolta criticità (pallini gialli/rossi) per sintesi finale
+    _issues = []
+    _issue_texts = set()
+
+    def _add_issue(item: str, dot_html: str):
+        """Aggiunge una voce di criticità (evitando duplicati) con il relativo pallino colorato."""
+        try:
+            item = str(item).strip()
+        except Exception:
+            return
+        if not item:
+            return
+        if item in _issue_texts:
+            return
+        _issue_texts.add(item)
+        _issues.append({"text": item, "dot": dot_html})
+# Preparazioni comuni
     ops_df = ops_df_saved.copy()
     ops_df["Asset Class"] = [
         _lookup_asset_class(isin=str(i), name=str(n))
@@ -5949,8 +5964,42 @@ def render_monitoraggio_portafoglio():
         else:
             st.info("Non risultano conferimenti periodici o spese future nel periodo residuo (oppure non sono state definite ex‑ante).")
 
+        # -----------------------------------------------------------------
+        # Valutazione allineamento flussi di cassa effettivi vs programmati
+        # -----------------------------------------------------------------
 
-    
+    # Calcolo rapporto ad oggi: |Cum_Actual - Cum_Plan| / |Cum_Plan|
+    # (usa l'ultimo punto disponibile <= oggi)
+    try:
+        cum_plan_today = float(snap.get("Cum_Plan", 0.0) or 0.0)
+        cum_act_today = float(snap.get("Cum_Actual", 0.0) or 0.0)
+        denom = abs(cum_plan_today)
+        ratio = None if denom < 1e-12 else abs(cum_act_today - cum_plan_today) / denom
+    except Exception:
+        ratio = None
+
+    DOT_SIZE = 30  # pallino grande (coerente con le altre valutazioni)
+    if ratio is None:
+        msg = "Allineamento flussi di cassa: dato non disponibile"
+        dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+    else:
+        if ratio < 0.05:
+            msg = "Adeguato allineamento dei flussi di cassa effettivi con quelli programmati"
+            dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # verde
+        elif ratio <= 0.12:
+            msg = "Correggere il parzialmente disallineamento dei flussi di cassa effettivi verso quelli programmati"
+            dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # giallo
+            _add_issue("Flussi di cassa: " + msg, dot)
+        else:
+            msg = "Elevato disallineamento dei flussi di cassa effettivi verso quelli programmati"
+            dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # rosso
+            _add_issue("Flussi di cassa: " + msg, dot)
+
+    st.markdown(
+        f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:6px 0 0 0;">'
+        f'<span>{msg}</span>{dot}</div>',
+        unsafe_allow_html=True
+    )
 
 
 # -----------------------------
@@ -6074,6 +6123,34 @@ def render_monitoraggio_portafoglio():
         fig.add_trace(go.Bar(x=comp_cmp["Asset Class"], y=comp_cmp["Weight"], name="Effettivo", hovertemplate="%{x}<br>%{y:.1%}<extra></extra>"))
         fig.update_layout(barmode="group", height=360, margin=dict(l=10, r=10, t=20, b=10), xaxis_title="Asset Class", yaxis_title="Peso")
         st.plotly_chart(fig, use_container_width=True)
+        # Valutazione disallineamento medio tra pesi Target ed Effettivi (media delle differenze assolute)
+        try:
+            _mean_abs_gap = float((comp_cmp["Weight"] - comp_cmp["Target"]).abs().mean()) if not comp_cmp.empty else None
+        except Exception:
+            _mean_abs_gap = None
+
+        DOT_SIZE = 30  # pallino grande (coerente con le altre valutazioni)
+        if _mean_abs_gap is None or (isinstance(_mean_abs_gap, float) and np.isnan(_mean_abs_gap)):
+            _msg = "Allineamento alla composizione target: dato non disponibile"
+            _dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+        else:
+            if _mean_abs_gap < 0.04:
+                _msg = "Adeguato allineamento delle asset class alla composizione target"
+                _dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+            elif _mean_abs_gap <= 0.08:
+                _msg = "Correggere il parziale disallineamento del portafoglio alla composizione target"
+                _dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                _add_issue("Composizione portafoglio: " + _msg, _dot)
+            else:
+                _msg = "Elevato disallineamento del portafoglio dalla composizione target"
+                _dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                _add_issue("Composizione portafoglio: " + _msg, _dot)
+
+        st.markdown(
+            f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:8px 0 0 0;">'
+            f'<span>{_msg}</span>{_dot}</div>',
+            unsafe_allow_html=True
+        )
 
     with colB:
         st.markdown(f"**Tempo trascorso dall’inizio investimento:** {elapsed_years} anni")
@@ -6497,155 +6574,7 @@ def render_monitoraggio_portafoglio():
 
     else:
         st.warning("Impossibile generare il grafico: servono Operazioni + Database Prezzi Prodotti (Serie Storiche Prodotti).")
-    # 4) (GBI) Stima Probabilità di S di Successo
-    # -----------------------------
-    if bool(payload.get("gbi", False)):
-        st.markdown("## Stima Probabilità di Successo")
-        st.caption("Stima aggiornata delle probabilità di successo sugli obiettivi residui, considerando il montante attuale e i conferimenti futuri residuali programmati.")
-
-        # Recupera baseline
-        p0 = float(payload.get("gbi_best_success_prob", np.nan) or np.nan)
-        st.markdown(f"**Probabilità di successo iniziale (alla creazione):** {p0:.1%}" if np.isfinite(p0) else "**Probabilità di successo iniziale:** —")
-
-        # stima aggiornata (approccio operativo): usa Monte Carlo su asset class con parametri storici
-        mdb = st.session_state.get("market_database", None)
-        can_mc = isinstance(mdb, dict) and isinstance(mdb.get("df"), pd.DataFrame) and (not mdb["df"].empty)
-        if not can_mc:
-            st.warning("Database Mercati non disponibile: impossibile stimare una probabilità aggiornata.")
-        else:
-            # prepara obiettivi residui (anni scalati)
-            elapsed_years = _elapsed_years_from_ops(ops_df)
-            objectives = payload.get("gbi_objectives", []) if isinstance(payload.get("gbi_objectives"), list) else []
-            residual_obj = []
-            for ob in objectives:
-                ob2 = dict(ob)
-                sched2 = []
-                for s in ob.get("schedule", []) or []:
-                    try:
-                        y = int(s.get("year", 0))
-                        amt = float(s.get("amount", 0.0))
-                    except Exception:
-                        continue
-                    y2 = y - elapsed_years
-                    if y2 > 0 and amt > 0:
-                        sched2.append({"year": y2, "amount": amt})
-                ob2["schedule"] = sched2
-                if sched2:
-                    residual_obj.append(ob2)
-
-            # orizzonte residuo
-            T_tot = int(payload.get("horizon_years", 0) or 1)
-            T_rem = max(1, T_tot - elapsed_years)
-
-            # cash_in residuali (portfolio view)
-            initial_now = float(current_wealth)
-            periodic_amount = float(payload.get("periodic_amount", 0.0) or 0.0)
-            periodic_years = int(payload.get("periodic_years", 0) or 0)
-            freq = str(payload.get("periodic_freq", "Annuale") or "Annuale")
-            per_year = 0.0
-            if periodic_amount != 0.0:
-                if freq.lower().startswith("mens"):
-                    per_year = periodic_amount * 12.0
-                elif freq.lower().startswith("trim"):
-                    per_year = periodic_amount * 4.0
-                elif freq.lower().startswith("sem"):
-                    per_year = periodic_amount * 2.0
-                else:
-                    per_year = periodic_amount * 1.0
-
-            # anni residui di versamenti
-            per_years_rem = max(0, periodic_years - elapsed_years)
-
-            # Estima mu/cov mensili dalle serie storiche
-            dfm = mdb["df"].copy()
-            date_col = None
-            for c in dfm.columns:
-                if str(c).lower().strip() in ["date", "data"]:
-                    date_col = c
-                    break
-            dfm[date_col] = pd.to_datetime(dfm[date_col], errors="coerce")
-            dfm = dfm.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
-            dfm["Month"] = dfm[date_col].dt.to_period("M").dt.to_timestamp()
-
-            comp_df3 = _composition_path_df(payload)
-            comp_df3 = comp_df3.sort_values("Anno").reset_index(drop=True)
-            asset_cols0 = [c for c in comp_df3.columns if c != "Anno"]
-            assets_use = [a for a in asset_cols0 if a in dfm.columns]
-            if not assets_use:
-                st.warning("Asset class non trovate nel Database Mercati: impossibile stimare la probabilità aggiornata.")
-            else:
-                hist = dfm[assets_use].copy()
-                for a in assets_use:
-                    hist[a] = pd.to_numeric(hist[a], errors="coerce").fillna(0.0).clip(lower=-0.9999)
-                mu_m = hist.mean().values
-                cov_m = hist.cov().values + np.eye(len(assets_use))*1e-10
-                scen = 1000
-                months_fwd = int(T_rem * 12)
-                rng = np.random.default_rng(24680)
-                Z = rng.standard_normal(size=(scen * months_fwd, len(assets_use)))
-                try:
-                    L = np.linalg.cholesky(cov_m)
-                except np.linalg.LinAlgError:
-                    L = np.linalg.cholesky(cov_m + np.eye(cov_m.shape[0]) * 1e-8)
-                X = Z @ L.T
-                sim = (X + mu_m).reshape(scen, months_fwd, len(assets_use))
-
-                # pesi mensili residuali: anno = elapsed + floor(mi/12)
-                def _w_for_month_idx(mi: int) -> np.ndarray:
-                    y = elapsed_years + int(mi // 12)
-                    if (comp_df3["Anno"] >= y).any():
-                        r = comp_df3[comp_df3["Anno"] >= y].iloc[0]
-                    else:
-                        r = comp_df3.iloc[-1]
-                    w = np.array([float(r.get(a, 0.0)) for a in assets_use], dtype=float)
-                    s = w.sum()
-                    return w/s if s>0 else np.full_like(w, 1.0/len(w))
-
-                # obiettivi in mesi (fine mese 12*y -1)
-                obj_months = []
-                for ob in residual_obj:
-                    for s in ob.get("schedule", []) or []:
-                        y = int(s.get("year", 0))
-                        amt = float(s.get("amount", 0.0))
-                        if y>0 and amt>0:
-                            m_idx = int(y*12) - 1
-                            if 0 <= m_idx < months_fwd:
-                                obj_months.append((m_idx, amt))
-                obj_months.sort(key=lambda x: x[0])
-
-                # Monte Carlo
-                success = 0
-                for s in range(scen):
-                    wealth = float(initial_now)
-                    ok = True
-                    for mi in range(months_fwd):
-                        # contributi residuali (a inizio anno)
-                        if mi % 12 == 0:
-                            year_i = int(mi//12) + 1
-                            if 1 <= year_i <= per_years_rem:
-                                wealth += float(per_year)
-                        # rendimento
-                        w = _w_for_month_idx(mi)
-                        r_p = float(np.dot(w, sim[s, mi, :]))
-                        wealth = max(0.0, wealth * (1.0 + r_p))
-                        # obiettivi
-                        for (mm, amt) in obj_months:
-                            if mm == mi:
-                                wealth -= amt
-                                if wealth < 0:
-                                    ok = False
-                                break
-                        if not ok:
-                            break
-                    if ok and wealth >= 0:
-                        success += 1
-
-                p_now = success / scen
-                st.metric("Probabilità di successo aggiornata (stima)", f"{p_now:.1%}")
-                if np.isfinite(p0):
-                    st.metric("Variazione vs iniziale", f"{(p_now - p0):+.1%}")
-
-        # -----------------------------
+# -----------------------------
         # 5) (GBI) Riformula il Portafoglio GBI
         # -----------------------------
         st.markdown("## Riformula il Portafoglio GBI")
@@ -6672,7 +6601,570 @@ def render_monitoraggio_portafoglio():
             unsafe_allow_html=True
         )
 
+    # -----------------------------
+    # 6) Valutazione Prodotti
+    # -----------------------------
+    st.markdown("## Valutazione Prodotti")
+    st.caption("Valutazione sintetica della qualità dei prodotti attualmente in portafoglio.")
 
+        # ---- Valutazione Qualità dei Prodotti (Rating Quantalys per singolo prodotto) ----
+    st.markdown(
+        '<div style="font-size:18px; font-weight:700; margin-top:0.2rem;">Valutazione Qualità dei Prodotti</div>',
+        unsafe_allow_html=True
+    )
+
+    db_prod = st.session_state.get("product_database", None)
+    if not (isinstance(db_prod, dict) and isinstance(db_prod.get("df"), pd.DataFrame) and (not db_prod["df"].empty)):
+        st.warning("Database Prodotti non disponibile: impossibile valutare il Rating Quantalys dei prodotti in portafoglio.")
+    else:
+        dfp = db_prod["df"].copy()
+
+        # individua colonne (robusto a naming diversi)
+        cols = list(dfp.columns)
+
+        isin_col = None
+        for c in cols:
+            if str(c).strip().lower() == "isin":
+                isin_col = c
+                break
+
+        quant_col = None
+        quant_cands = ["Rating Quantalys", "rating_quantalys", "quantalys", "Quantalys"]
+        for c in cols:
+            if str(c).strip() in quant_cands:
+                quant_col = c
+                break
+        if quant_col is None:
+            for c in cols:
+                if str(c).strip().lower() in [x.lower() for x in quant_cands]:
+                    quant_col = c
+                    break
+
+        name_col = None
+        name_cands = ["Nome Prodotto", "Prodotto", "product_name", "name", "Nome", "nome_prodotto", "nome"]
+        for c in cols:
+            if str(c).strip() in name_cands:
+                name_col = c
+                break
+        if name_col is None:
+            for c in cols:
+                if str(c).strip().lower() in [x.lower() for x in name_cands]:
+                    name_col = c
+                    break
+
+        # ISIN attualmente detenuti (da operazioni)
+        held_isins = []
+        try:
+            if isinstance(ops_df, pd.DataFrame) and (not ops_df.empty) and ("ISIN" in ops_df.columns) and ("Tipo" in ops_df.columns) and ("Quantita" in ops_df.columns):
+                _ops_q = ops_df.copy()
+                _ops_q["SignedQty"] = np.where(_ops_q["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * pd.to_numeric(_ops_q["Quantita"], errors="coerce").fillna(0.0)
+                _qty = _ops_q.groupby("ISIN", as_index=True)["SignedQty"].sum()
+                _qty = _qty[_qty > 0].copy()
+                held_isins = [str(x).strip().upper() for x in _qty.index.tolist() if str(x).strip()]
+        except Exception:
+            held_isins = []
+
+        if not held_isins:
+            st.info("Nessun prodotto in portafoglio (ISIN detenuti) rilevato dalle operazioni.")
+        elif isin_col is None or quant_col is None:
+            st.warning("Colonne ISIN e/o Rating Quantalys non trovate nel Database Prodotti: impossibile effettuare la valutazione per singolo prodotto.")
+        else:
+            dfp["_isin_norm_"] = dfp[isin_col].astype(str).str.upper().str.strip()
+            sel = dfp[dfp["_isin_norm_"].isin(held_isins)].copy()
+
+            if sel.empty:
+                st.info("Nessun match tra ISIN detenuti e Database Prodotti.")
+            else:
+                # nome prodotto
+                if name_col is not None:
+                    sel["_prod_name_"] = sel[name_col].astype(str).str.strip()
+                    sel.loc[sel["_prod_name_"] == "", "_prod_name_"] = sel["_isin_norm_"]
+                else:
+                    sel["_prod_name_"] = sel["_isin_norm_"]
+
+                # rating
+                sel["_rating_"] = pd.to_numeric(sel[quant_col], errors="coerce")
+
+                # ordina per nome (stabile)
+                sel = sel.sort_values("_prod_name_")
+
+                DOT_SIZE = 30  # pallino più grande (richiesta utente)
+                for _, r in sel.iterrows():
+                    nm = str(r.get("_prod_name_", "")).strip() or str(r.get("_isin_norm_", "")).strip()
+                    rv = r.get("_rating_", np.nan)
+
+                    if pd.isna(rv):
+                        dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                        extra = " (Rating non disponibile)"
+                    else:
+                        rv = float(rv)
+                        extra = ""
+                        if rv >= 4.0:
+                            dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # verde
+                        elif rv >= 3.0:
+                            dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # giallo
+                            _add_issue(f"Qualità prodotto (Rating Quantalys): {nm}", dot)
+                        else:
+                            dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # rosso
+                            _add_issue(f"Qualità prodotto (Rating Quantalys): {nm}", dot)
+
+                    st.markdown(
+                        f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:2px 0;">'
+                        f'<span>{nm}{extra}</span>{dot}</div>',
+                        unsafe_allow_html=True
+                    )
+
+
+
+    # ---- Valutazione Dimensione dei Prodotti (AUM) - per singolo prodotto ----
+    st.markdown(
+        '<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Valutazione Dimensione dei Prodotti (AUM)</div>',
+        unsafe_allow_html=True
+    )
+    st.caption("Semaforo basato sugli Asset Under Management (AUM) del singolo prodotto: verde > 150M€, giallo 80–150M€, rosso < 80M€.")
+
+    db_prod = st.session_state.get("product_database", None)
+    if not (isinstance(db_prod, dict) and isinstance(db_prod.get("df"), pd.DataFrame) and (not db_prod["df"].empty)):
+        st.warning("Database Prodotti non disponibile: impossibile valutare la dimensione (AUM) dei prodotti in portafoglio.")
+    else:
+        dfp_aum = db_prod["df"].copy()
+        cols_aum = list(dfp_aum.columns)
+
+        # colonne chiave (robusto a naming diversi)
+        isin_col_aum = None
+        for c in cols_aum:
+            if str(c).strip().lower() == "isin":
+                isin_col_aum = c
+                break
+
+        name_col_aum = None
+        name_cands = ["Nome Prodotto", "Prodotto", "product_name", "name", "Nome", "nome_prodotto", "nome"]
+        for c in cols_aum:
+            if str(c).strip() in name_cands:
+                name_col_aum = c
+                break
+        if name_col_aum is None:
+            for c in cols_aum:
+                if str(c).strip().lower() in [x.lower() for x in name_cands]:
+                    name_col_aum = c
+                    break
+
+        aum_col = None
+        aum_cands = ["aum_eur", "AUM", "aum", "AUM EUR", "AUM (EUR)"]
+        for c in cols_aum:
+            if str(c).strip() in aum_cands:
+                aum_col = c
+                break
+        if aum_col is None:
+            for c in cols_aum:
+                if str(c).strip().lower() in [x.lower() for x in aum_cands]:
+                    aum_col = c
+                    break
+
+        # ISIN attualmente detenuti (da operazioni)
+        held_isins = []
+        try:
+            if isinstance(ops_df, pd.DataFrame) and (not ops_df.empty) and ("ISIN" in ops_df.columns) and ("Tipo" in ops_df.columns) and ("Quantita" in ops_df.columns):
+                _ops_q = ops_df.copy()
+                _ops_q["SignedQty"] = np.where(_ops_q["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * pd.to_numeric(_ops_q["Quantita"], errors="coerce").fillna(0.0)
+                _qty = _ops_q.groupby("ISIN", as_index=True)["SignedQty"].sum()
+                _qty = _qty[_qty > 0].copy()
+                held_isins = [str(x).strip().upper() for x in _qty.index.tolist() if str(x).strip()]
+        except Exception:
+            held_isins = []
+
+        if not held_isins:
+            st.info("Nessun prodotto in portafoglio (ISIN detenuti) rilevato dalle operazioni.")
+        elif isin_col_aum is None or aum_col is None:
+            st.warning("Colonne ISIN e/o aum_eur non trovate nel Database Prodotti: impossibile effettuare la valutazione dimensione (AUM) per singolo prodotto.")
+        else:
+            dfp_aum["_isin_norm_"] = dfp_aum[isin_col_aum].astype(str).str.upper().str.strip()
+            dfp_aum["_aum_"] = pd.to_numeric(dfp_aum[aum_col], errors="coerce")
+
+            sel = dfp_aum[dfp_aum["_isin_norm_"].isin(held_isins)].copy()
+            if sel.empty:
+                st.info("Nessun match tra ISIN detenuti e Database Prodotti.")
+            else:
+                # nome prodotto
+                if name_col_aum is not None:
+                    sel["_prod_name_"] = sel[name_col_aum].astype(str).str.strip()
+                    sel.loc[sel["_prod_name_"] == "", "_prod_name_"] = sel["_isin_norm_"]
+                else:
+                    sel["_prod_name_"] = sel["_isin_norm_"]
+
+                sel = sel.sort_values("_prod_name_")
+
+                DOT_SIZE = 30  # pallino grande (richiesta utente)
+                for _, r in sel.iterrows():
+                    nm = str(r.get("_prod_name_", "")).strip() or str(r.get("_isin_norm_", "")).strip()
+                    av = r.get("_aum_", np.nan)
+
+                    if pd.isna(av):
+                        dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                        extra = " (AUM non disponibile)"
+                    else:
+                        av = float(av)
+                        extra = ""
+                        if av > 150_000_000:
+                            dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # verde
+                        elif 80_000_000 <= av <= 150_000_000:
+                            dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # giallo
+                            _add_issue(f"Dimensione prodotto (AUM): {nm}", dot)
+                        else:
+                            dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # rosso
+                            _add_issue(f"Dimensione prodotto (AUM): {nm}", dot)
+
+                    st.markdown(
+                        f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:2px 0;">'
+                        f'<span>{nm}{extra}</span>{dot}</div>',
+                        unsafe_allow_html=True
+                    )
+
+
+    # ---- Valutazione Liquidità dei Prodotti (spread) - per singolo prodotto ----
+    st.markdown(
+        '<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Valutazione Liquidità dei Prodotti (spread)</div>',
+        unsafe_allow_html=True
+    )
+
+    db_prod = st.session_state.get("product_database", None)
+    if not (isinstance(db_prod, dict) and isinstance(db_prod.get("df"), pd.DataFrame) and (not db_prod["df"].empty)):
+        st.warning("Database Prodotti non disponibile: impossibile valutare la liquidità (spread) dei prodotti in portafoglio.")
+    else:
+        dfp_liq = db_prod["df"].copy()
+        cols_liq = list(dfp_liq.columns)
+
+        # colonne chiave (robusto a naming diversi)
+        isin_col_liq = None
+        for c in cols_liq:
+            if str(c).strip().lower() == "isin":
+                isin_col_liq = c
+                break
+
+        name_col_liq = None
+        name_cands = ["Nome Prodotto", "Prodotto", "product_name", "name", "Nome", "nome_prodotto", "nome"]
+        for c in cols_liq:
+            if str(c).strip() in name_cands:
+                name_col_liq = c
+                break
+        if name_col_liq is None:
+            for c in cols_liq:
+                if str(c).strip().lower() in [x.lower() for x in name_cands]:
+                    name_col_liq = c
+                    break
+
+        spread_col = None
+        spread_cands = ["spread_bps", "Spread (bps)", "Spread bps", "spread", "Spread"]
+        for c in cols_liq:
+            if str(c).strip() in spread_cands:
+                spread_col = c
+                break
+        if spread_col is None:
+            for c in cols_liq:
+                if str(c).strip().lower() in [x.lower() for x in spread_cands]:
+                    spread_col = c
+                    break
+
+        # ISIN attualmente detenuti (da operazioni)
+        held_isins = []
+        try:
+            if isinstance(ops_df, pd.DataFrame) and (not ops_df.empty) and ("ISIN" in ops_df.columns) and ("Tipo" in ops_df.columns) and ("Quantita" in ops_df.columns):
+                _ops_q = ops_df.copy()
+                _ops_q["SignedQty"] = np.where(_ops_q["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * pd.to_numeric(_ops_q["Quantita"], errors="coerce").fillna(0.0)
+                _qty = _ops_q.groupby("ISIN", as_index=True)["SignedQty"].sum()
+                _qty = _qty[_qty > 0].copy()
+                held_isins = [str(x).strip().upper() for x in _qty.index.tolist() if str(x).strip()]
+        except Exception:
+            held_isins = []
+
+        if not held_isins:
+            st.info("Nessun prodotto in portafoglio (ISIN detenuti) rilevato dalle operazioni.")
+        elif isin_col_liq is None or spread_col is None:
+            st.warning("Colonne ISIN e/o spread_bps non trovate nel Database Prodotti: impossibile effettuare la valutazione di liquidità.")
+        else:
+            dfp_liq["_isin_norm_"] = dfp_liq[isin_col_liq].astype(str).str.upper().str.strip()
+            dfp_liq["_spread_"] = pd.to_numeric(dfp_liq[spread_col], errors="coerce")
+            all_spreads = dfp_liq["_spread_"].dropna()
+
+            sel = dfp_liq[dfp_liq["_isin_norm_"].isin(held_isins)].copy()
+            if sel.empty:
+                st.info("Nessun match tra ISIN detenuti e Database Prodotti.")
+            else:
+                # nome prodotto
+                if name_col_liq is not None:
+                    sel["_prod_name_"] = sel[name_col_liq].astype(str).str.strip()
+                    sel.loc[sel["_prod_name_"] == "", "_prod_name_"] = sel["_isin_norm_"]
+                else:
+                    sel["_prod_name_"] = sel["_isin_norm_"]
+
+                sel = sel.sort_values("_prod_name_")
+
+                DOT_SIZE = 30  # pallino grande (coerente con la sezione Qualità)
+                for _, r in sel.iterrows():
+                    nm = str(r.get("_prod_name_", "")).strip() or str(r.get("_isin_norm_", "")).strip()
+                    sv = r.get("_spread_", np.nan)
+
+                    if all_spreads.empty or pd.isna(sv):
+                        dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                        extra = " (Spread non disponibile)"
+                    else:
+                        sv = float(sv)
+                        # percentile: quota di prodotti con spread inferiore (più basso = migliore)
+                        perc = float((all_spreads < sv).mean() * 100.0)
+
+                        if perc < 30.0:
+                            dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # verde
+                        elif perc <= 70.0:
+                            dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # giallo
+                            _add_issue(f"Liquidità (spread percentile): {nm}", dot)
+                        else:
+                            dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # rosso
+                            _add_issue(f"Liquidità (spread percentile): {nm}", dot)
+                        extra = ""
+
+                    st.markdown(
+                        f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:2px 0;">'
+                        f'<span>{nm}{extra}</span>{dot}</div>',
+                        unsafe_allow_html=True
+                    )
+
+
+    # ---- Valutazione Coerenza dei Prodotti - per singolo prodotto ----
+    st.markdown(
+        '<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Valutazione Coerenza dei Prodotti</div>',
+        unsafe_allow_html=True
+    )
+    st.caption("Semaforo basato sulla variabile 'Coerenza con Mercato' del singolo prodotto: verde=1, giallo=2, rosso>2.")
+
+    db_prod = st.session_state.get("product_database", None)
+    if not (isinstance(db_prod, dict) and isinstance(db_prod.get("df"), pd.DataFrame) and (not db_prod["df"].empty)):
+        st.warning("Database Prodotti non disponibile: impossibile valutare la coerenza (Coerenza con Mercato) dei prodotti in portafoglio.")
+    else:
+        dfp_coh = db_prod["df"].copy()
+        cols_coh = list(dfp_coh.columns)
+
+        # colonne chiave
+        isin_col_coh = None
+        for c in cols_coh:
+            if str(c).strip().lower() == "isin":
+                isin_col_coh = c
+                break
+
+        name_col_coh = None
+        name_cands = ["Nome Prodotto", "Prodotto", "product_name", "name", "Nome", "nome_prodotto", "nome"]
+        for c in cols_coh:
+            if str(c).strip() in name_cands:
+                name_col_coh = c
+                break
+        if name_col_coh is None:
+            for c in cols_coh:
+                if str(c).strip().lower() in [x.lower() for x in name_cands]:
+                    name_col_coh = c
+                    break
+
+        coh_col = None
+        coh_cands = ["Coerenza con Mercato", "Coerenza Mercato", "coerenza con mercato", "coerenza mercato", "Coerenza con il Mercato"]
+        for c in cols_coh:
+            if str(c).strip() in coh_cands:
+                coh_col = c
+                break
+        if coh_col is None:
+            for c in cols_coh:
+                if str(c).strip().lower() in [x.lower() for x in coh_cands]:
+                    coh_col = c
+                    break
+
+        # ISIN detenuti
+        held_isins = []
+        try:
+            if isinstance(ops_df, pd.DataFrame) and (not ops_df.empty) and ("ISIN" in ops_df.columns) and ("Tipo" in ops_df.columns) and ("Quantita" in ops_df.columns):
+                _ops_q = ops_df.copy()
+                _ops_q["SignedQty"] = np.where(_ops_q["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * pd.to_numeric(_ops_q["Quantita"], errors="coerce").fillna(0.0)
+                _qty = _ops_q.groupby("ISIN", as_index=True)["SignedQty"].sum()
+                _qty = _qty[_qty > 0].copy()
+                held_isins = [str(x).strip().upper() for x in _qty.index.tolist() if str(x).strip()]
+        except Exception:
+            held_isins = []
+
+        if not held_isins:
+            st.info("Nessun prodotto in portafoglio (ISIN detenuti) rilevato dalle operazioni.")
+        elif isin_col_coh is None or coh_col is None:
+            st.warning("Colonne ISIN e/o 'Coerenza con Mercato' non trovate nel Database Prodotti: impossibile effettuare la valutazione per singolo prodotto.")
+        else:
+            dfp_coh["_isin_norm_"] = dfp_coh[isin_col_coh].astype(str).str.upper().str.strip()
+            dfp_coh["_coh_"] = pd.to_numeric(dfp_coh[coh_col], errors="coerce")
+
+            sel = dfp_coh[dfp_coh["_isin_norm_"].isin(held_isins)].copy()
+            if sel.empty:
+                st.info("Nessun match tra ISIN detenuti e Database Prodotti.")
+            else:
+                if name_col_coh is not None:
+                    sel["_prod_name_"] = sel[name_col_coh].astype(str).str.strip()
+                    sel.loc[sel["_prod_name_"] == "", "_prod_name_"] = sel["_isin_norm_"]
+                else:
+                    sel["_prod_name_"] = sel["_isin_norm_"]
+
+                sel = sel.sort_values("_prod_name_")
+
+                DOT_SIZE = 30
+                for _, r in sel.iterrows():
+                    nm = str(r.get("_prod_name_", "")).strip() or str(r.get("_isin_norm_", "")).strip()
+                    cv = r.get("_coh_", np.nan)
+
+                    if pd.isna(cv):
+                        dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                        extra = " (Dato non disponibile)"
+                    else:
+                        cv = float(cv)
+                        extra = ""
+                        if cv == 1:
+                            dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # verde
+                        elif cv == 2:
+                            dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # giallo
+                            _add_issue(f"Coerenza con Mercato: {nm}", dot)
+                        else:
+                            dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # rosso
+                            _add_issue(f"Coerenza con Mercato: {nm}", dot)
+
+                    st.markdown(
+                        f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:2px 0;">'
+                        f'<span>{nm}{extra}</span>{dot}</div>',
+                        unsafe_allow_html=True
+                    )
+
+
+    # ---- Valutazione Costi dei Prodotti (TER percentile per asset class) ----
+    st.markdown(
+        '<div style="font-size:18px; font-weight:700; margin-top:0.8rem;">Valutazione Costi dei Prodotti</div>',
+        unsafe_allow_html=True
+    )
+    st.caption("Semaforo basato sul percentile del TER del singolo prodotto rispetto ai TER di tutti i prodotti della stessa asset class nel Database: verde <30°, giallo 30°–70°, rosso >70°.")
+
+    db_prod = st.session_state.get("product_database", None)
+    if not (isinstance(db_prod, dict) and isinstance(db_prod.get("df"), pd.DataFrame) and (not db_prod["df"].empty)):
+        st.warning("Database Prodotti non disponibile: impossibile valutare i costi (TER) dei prodotti in portafoglio.")
+    else:
+        dfp_ter = db_prod["df"].copy()
+        cols_ter = list(dfp_ter.columns)
+
+        isin_col_ter = None
+        for c in cols_ter:
+            if str(c).strip().lower() == "isin":
+                isin_col_ter = c
+                break
+
+        name_col_ter = None
+        name_cands = ["Nome Prodotto", "Prodotto", "product_name", "name", "Nome", "nome_prodotto", "nome"]
+        for c in cols_ter:
+            if str(c).strip() in name_cands:
+                name_col_ter = c
+                break
+        if name_col_ter is None:
+            for c in cols_ter:
+                if str(c).strip().lower() in [x.lower() for x in name_cands]:
+                    name_col_ter = c
+                    break
+
+        ter_col = None
+        ter_cands = ["ter", "TER", "Total Expense Ratio", "total_expense_ratio"]
+        for c in cols_ter:
+            if str(c).strip() in ter_cands:
+                ter_col = c
+                break
+        if ter_col is None:
+            for c in cols_ter:
+                if str(c).strip().lower() in [x.lower() for x in ter_cands]:
+                    ter_col = c
+                    break
+
+        asset_col = None
+        asset_cands = ["asset_class", "Asset Class", "Asset class", "asset class", "Mercato", "mercato"]
+        for c in cols_ter:
+            if str(c).strip() in asset_cands:
+                asset_col = c
+                break
+        if asset_col is None:
+            for c in cols_ter:
+                if str(c).strip().lower() in [x.lower() for x in asset_cands]:
+                    asset_col = c
+                    break
+
+        # ISIN detenuti
+        held_isins = []
+        try:
+            if isinstance(ops_df, pd.DataFrame) and (not ops_df.empty) and ("ISIN" in ops_df.columns) and ("Tipo" in ops_df.columns) and ("Quantita" in ops_df.columns):
+                _ops_q = ops_df.copy()
+                _ops_q["SignedQty"] = np.where(_ops_q["Tipo"].astype(str).str.upper() == "BUY", 1.0, -1.0) * pd.to_numeric(_ops_q["Quantita"], errors="coerce").fillna(0.0)
+                _qty = _ops_q.groupby("ISIN", as_index=True)["SignedQty"].sum()
+                _qty = _qty[_qty > 0].copy()
+                held_isins = [str(x).strip().upper() for x in _qty.index.tolist() if str(x).strip()]
+        except Exception:
+            held_isins = []
+
+        if not held_isins:
+            st.info("Nessun prodotto in portafoglio (ISIN detenuti) rilevato dalle operazioni.")
+        elif isin_col_ter is None or ter_col is None or asset_col is None:
+            st.warning("Colonne ISIN e/o TER e/o asset_class non trovate nel Database Prodotti: impossibile calcolare il percentile del TER per asset class.")
+        else:
+            dfp_ter["_isin_norm_"] = dfp_ter[isin_col_ter].astype(str).str.upper().str.strip()
+            dfp_ter["_ter_"] = pd.to_numeric(dfp_ter[ter_col], errors="coerce")
+            dfp_ter["_asset_"] = dfp_ter[asset_col].astype(str).str.strip()
+
+            # percentile TER per asset class (TER più basso = percentile più basso)
+            valid_mask = dfp_ter["_asset_"].notna() & (dfp_ter["_asset_"] != "") & dfp_ter["_ter_"].notna()
+            dfp_ter["_ter_pct_"] = np.nan
+            if valid_mask.any():
+                dfp_ter.loc[valid_mask, "_ter_pct_"] = dfp_ter.loc[valid_mask].groupby("_asset_")["_ter_"].rank(pct=True, method="average") * 100.0
+
+            sel = dfp_ter[dfp_ter["_isin_norm_"].isin(held_isins)].copy()
+            if sel.empty:
+                st.info("Nessun match tra ISIN detenuti e Database Prodotti.")
+            else:
+                if name_col_ter is not None:
+                    sel["_prod_name_"] = sel[name_col_ter].astype(str).str.strip()
+                    sel.loc[sel["_prod_name_"] == "", "_prod_name_"] = sel["_isin_norm_"]
+                else:
+                    sel["_prod_name_"] = sel["_isin_norm_"]
+
+                sel = sel.sort_values("_prod_name_")
+
+                DOT_SIZE = 30
+                for _, r in sel.iterrows():
+                    nm = str(r.get("_prod_name_", "")).strip() or str(r.get("_isin_norm_", "")).strip()
+                    pct = r.get("_ter_pct_", np.nan)
+
+                    if pd.isna(pct):
+                        dot = f'<span style="color:#757575; font-size:{DOT_SIZE}px; line-height:1;">●</span>'
+                        extra = " (Percentile non disponibile)"
+                    else:
+                        pct = float(pct)
+                        extra = ""
+                        if pct < 30.0:
+                            dot = f'<span style="color:#2e7d32; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # verde
+                        elif 30.0 <= pct <= 70.0:
+                            dot = f'<span style="color:#f9a825; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # giallo
+                            _add_issue(f"Costi (TER percentile): {nm}", dot)
+                        else:
+                            dot = f'<span style="color:#c62828; font-size:{DOT_SIZE}px; line-height:1;">●</span>'  # rosso
+                            _add_issue(f"Costi (TER percentile): {nm}", dot)
+
+                    st.markdown(
+                        f'<div style="display:flex; align-items:center; gap:12px; font-size:16px; margin:2px 0;">'
+                        f'<span>{nm}{extra}</span>{dot}</div>',
+                        unsafe_allow_html=True
+                    )
+
+    # ---- Sintesi delle problematiche emerse (giallo/rosso) ----
+    st.markdown("## Sintesi delle problematiche emerse")
+    if _issues:
+        for rec in _issues:
+            st.markdown(
+                f'<div style="display:flex; align-items:center; gap:10px; margin:2px 0;">'
+                f'<span>{rec["dot"]}</span><span>{rec["text"]}</span></div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.caption("Nessuna criticità (pallini gialli o rossi) rilevata nelle valutazioni mostrate.")
 # =======================
 # Crea Soluzione di Investimento → Asset-Only
 # =======================
