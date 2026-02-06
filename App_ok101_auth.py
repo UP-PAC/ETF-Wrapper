@@ -48,7 +48,7 @@ import json
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-st.set_page_config(page_title="ETF Wrapper – Demo UI", page_icon="📈", layout="wide")
+st.set_page_config(page_title="ETF Wrapper", page_icon="📈", layout="wide")
 
 # ============================================================
 # Colori coerenti per Asset Class (Plotly Express default)
@@ -653,6 +653,121 @@ def _render_floating_logout_button() -> None:
             color: rgba(0,0,0,0.9);
             border-color: rgba(0,0,0,0.25);
         }
+        
+        /* ====== Global App Aesthetics (non-invasive) ====== */
+        :root{
+            --uw-bg: #f6f7fb;
+            --uw-surface: #ffffff;
+            --uw-surface-2: rgba(255,255,255,0.92);
+            --uw-border: rgba(15, 23, 42, 0.10);
+            --uw-border-strong: rgba(15, 23, 42, 0.16);
+            --uw-text: rgba(15, 23, 42, 0.92);
+            --uw-muted: rgba(15, 23, 42, 0.62);
+            --uw-accent: #2563eb;        /* blue */
+            --uw-accent-2: #16a34a;      /* green */
+            --uw-warn: #f59e0b;          /* amber */
+            --uw-danger: #ef4444;        /* red */
+            --uw-radius: 18px;
+            --uw-shadow: 0 10px 30px rgba(2, 6, 23, 0.08);
+            --uw-shadow-soft: 0 6px 18px rgba(2, 6, 23, 0.06);
+        }
+
+        /* Canvas / background */
+        .stApp{
+            background: radial-gradient(1200px 700px at 20% -10%, rgba(37,99,235,0.10), transparent 60%),
+                        radial-gradient(900px 520px at 85% 0%, rgba(22,163,74,0.10), transparent 55%),
+                        var(--uw-bg);
+            color: var(--uw-text);
+        }
+
+        /* Layout spacing */
+        .block-container{
+            padding-top: 1.4rem !important;
+            padding-bottom: 3rem !important;
+            max-width: 1240px;
+        }
+
+        /* Hide Streamlit chrome */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+
+        /* Typography */
+        html, body, [class*="css"]{
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+        }
+        h1, h2, h3{
+            letter-spacing: -0.02em;
+        }
+        h1{ font-size: 2.05rem; font-weight: 800; margin-bottom: 0.3rem;}
+        h2{ font-size: 1.45rem; font-weight: 750; margin-top: 0.8rem;}
+        h3{ font-size: 1.15rem; font-weight: 700; color: var(--uw-text);}
+
+        /* Cards feel for common containers */
+        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMarkdownContainer"]) .uw-card,
+        .uw-card{
+            background: var(--uw-surface-2);
+            border: 1px solid var(--uw-border);
+            border-radius: var(--uw-radius);
+            box-shadow: var(--uw-shadow-soft);
+            padding: 14px 16px;
+        }
+
+        /* Inputs */
+        .stTextInput input, .stNumberInput input, .stDateInput input,
+        .stSelectbox > div, .stMultiSelect > div, .stTextArea textarea{
+            border-radius: 14px !important;
+        }
+        .stTextInput input, .stNumberInput input, .stTextArea textarea{
+            border: 1px solid var(--uw-border-strong) !important;
+            background: rgba(255,255,255,0.88) !important;
+        }
+
+        /* Buttons */
+        .stButton button{
+            border-radius: 14px !important;
+            border: 1px solid rgba(37,99,235,0.22) !important;
+            background: linear-gradient(180deg, rgba(37,99,235,0.14), rgba(37,99,235,0.08)) !important;
+            color: rgba(15,23,42,0.92) !important;
+            box-shadow: 0 8px 18px rgba(37,99,235,0.10);
+            padding: 0.55rem 0.85rem;
+        }
+        .stButton button:hover{
+            border-color: rgba(37,99,235,0.32) !important;
+            background: linear-gradient(180deg, rgba(37,99,235,0.18), rgba(37,99,235,0.10)) !important;
+            transform: translateY(-1px);
+        }
+
+        /* Tabs */
+        button[data-baseweb="tab"]{
+            border-radius: 999px !important;
+            padding: 10px 12px !important;
+        }
+        div[data-baseweb="tab-list"]{
+            gap: 6px;
+        }
+
+        /* Dataframes */
+        div[data-testid="stDataFrame"]{
+            border-radius: var(--uw-radius) !important;
+            border: 1px solid var(--uw-border) !important;
+            overflow: hidden;
+        }
+
+        /* Alerts */
+        div[data-testid="stAlert"]{
+            border-radius: var(--uw-radius) !important;
+        }
+
+        /* Sidebar */
+        section[data-testid="stSidebar"]{
+            background: linear-gradient(180deg, rgba(255,255,255,0.88), rgba(255,255,255,0.80)) !important;
+            border-right: 1px solid var(--uw-border);
+        }
+        section[data-testid="stSidebar"] .stMarkdown{
+            color: var(--uw-text);
+        }
+        
         </style>""",
         unsafe_allow_html=True,
     )
@@ -1445,6 +1560,80 @@ def top_nav_controls():
                 st.session_state["crea_subsection"] = "Asset-Only"
 
     return st.session_state["main_section"], st.session_state["tools_subsection"], st.session_state["crea_subsection"]
+
+
+def render_sidebar_index(main_section: str, tools_sub: str, crea_sub: str):
+    """Indice laterale guidato: aggiorna la navigazione senza modificare logiche o calcoli."""
+    valid_main = ["Clienti/Investitori", "Crea Soluzione di Investimento", "Selezione Prodotti", "Monitoraggio Portafoglio", "Analisi Asset Allocation", "Tools"]
+    valid_tools = ["Griglie Clientela", "Portafogli in Asset Class", "Database Mercati", "Database Prodotti", "Serie Storiche Prodotti"]
+    valid_crea = ["Asset-Only", "Goal-Based Investing"]
+
+    # Stato UI (solo estetica/UX)
+    if "compact_ui" not in st.session_state:
+        st.session_state["compact_ui"] = True
+
+    with st.sidebar:
+        st.markdown("## Indice")
+        st.caption("Navigazione rapida tra sezioni e sotto-sezioni.")
+
+        new_main = st.radio(
+            "Sezione",
+            valid_main,
+            index=valid_main.index(main_section) if main_section in valid_main else 0,
+            key="__idx_main",
+        )
+
+        new_tools = tools_sub
+        new_crea = crea_sub
+
+        if new_main == "Tools":
+            new_tools = st.radio(
+                "Sotto-sezione Tools",
+                valid_tools,
+                index=valid_tools.index(tools_sub) if tools_sub in valid_tools else 0,
+                key="__idx_tools",
+            )
+
+        if new_main == "Crea Soluzione di Investimento":
+            new_crea = st.radio(
+                "Modalità",
+                valid_crea,
+                index=valid_crea.index(crea_sub) if crea_sub in valid_crea else 0,
+                key="__idx_crea",
+            )
+
+        st.divider()
+        st.checkbox("Modalità compatta (meno testo a schermo)", key="compact_ui")
+
+    # Se l’utente cambia selezione, aggiorno session_state + query params e rilancio.
+    changed = (new_main != main_section) or (new_tools != tools_sub) or (new_crea != crea_sub)
+    if changed:
+        st.session_state["main_section"] = new_main
+        if new_main == "Tools":
+            st.session_state["tools_subsection"] = new_tools
+        if new_main == "Crea Soluzione di Investimento":
+            st.session_state["crea_subsection"] = new_crea
+
+        # Mantengo compatibilità con la navbar HTML (query params)
+        try:
+            qp = {}
+            qp["main"] = st.session_state["main_section"]
+            if st.session_state["main_section"] == "Tools":
+                qp["tools"] = st.session_state.get("tools_subsection", "Griglie Clientela")
+            if st.session_state["main_section"] == "Crea Soluzione di Investimento":
+                qp["crea"] = st.session_state.get("crea_subsection", "Asset-Only")
+            st.query_params.clear()
+            for k, v in qp.items():
+                st.query_params[k] = v
+        except Exception:
+            # fallback compatibilità vecchie versioni Streamlit
+            try:
+                st.experimental_set_query_params(**qp)
+            except Exception:
+                pass
+
+        st.rerun()
+
 
 def load_to_form(payload: dict):
     # Carico valori in session_state dei widget
@@ -7165,6 +7354,397 @@ def render_monitoraggio_portafoglio():
             )
     else:
         st.caption("Nessuna criticità (pallini gialli o rossi) rilevata nelle valutazioni mostrate.")
+
+    # ---- Verifica degli Obiettivi di Spesa (solo Goal-Based Investing) ----
+    def _is_goal_based(payload_: dict) -> bool:
+        try:
+            if bool(payload_.get("gbi", False)):
+                return True
+            if isinstance(payload_.get("gbi_objectives"), list) and len(payload_.get("gbi_objectives")) > 0:
+                return True
+            if payload_.get("gbi_best_success_prob") is not None or payload_.get("gbi_success_probs_by_priority") is not None:
+                return True
+            mode = str(payload_.get("mode", "") or "").strip().lower()
+            if mode in ("gbi", "goal-based", "goal based", "goal_based", "goalbased", "goal-based investing", "goal based investing"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _prob_to_float(p_):
+        try:
+            if p_ is None:
+                return None
+            p = float(p_)
+            # accetta sia 0–1 sia 0–100
+            if p > 1.5:
+                p = p / 100.0
+            return max(0.0, min(1.0, p))
+        except Exception:
+            return None
+
+    def _resolve_local_png(filename: str) -> str:
+        try:
+            base_dir = os.path.dirname(__file__)
+        except Exception:
+            base_dir = os.getcwd()
+        return os.path.join(base_dir, filename)
+
+    def _meteo_icon_from_probability(p: float):
+        # Coerente con la sezione GBI
+        if p > 0.90:
+            return _resolve_local_png("Prob Sole Pieno.png"), "Probabilità di successo molto elevata"
+        if p > 0.80:
+            return _resolve_local_png("Prob Poco Nuvoloso.png"), "Probabilità di successo elevata"
+        if p > 0.65:
+            return _resolve_local_png("Prob Nuvoloso.png"), "Probabilità di successo buona"
+        if p > 0.50:
+            return _resolve_local_png("Prob Molto Nuvoloso.png"), "Probabilità di successo discreta"
+        if p > 0.40:
+            return _resolve_local_png("Prob Pioggia.png"), "Probabilità di successo bassa"
+        return _resolve_local_png("Prob Fulmini.png"), "Probabilità di successo molto bassa"
+
+    def _render_prob_row(label: str, p_val):
+        p = _prob_to_float(p_val)
+        if p is None:
+            st.markdown(f"**{label}:** n.d.")
+            return
+        icon_path, icon_tip = _meteo_icon_from_probability(p)
+        pct = f"{p*100:.1f}%".replace(".", ",")
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            st.markdown(f"**{label}:** {pct}")
+        with c2:
+            try:
+                st.image(icon_path, width=64)
+            except Exception:
+                st.write("—")
+        with c3:
+            st.caption(icon_tip)
+
+    
+    def _extract_priority_probs(obj_list, probs_by_pr):
+        """Ritorna lista di tuple (label, prob) per obiettivi cumulati per priorità.
+
+        Supporta diversi formati salvati:
+        - dict {priority: prob} (chiavi int o str)
+        - list[dict] con campi vari (priority / pmax / 'Obiettivi fino a priorità', ecc.)
+        - list[float] ordinata per priorità crescente
+        """
+        out = []
+
+        # 1) Set di priorità dall'elenco obiettivi (se disponibile)
+        pr_sorted = []
+        try:
+            pr_sorted = sorted({int(ob.get("priority", 999999)) for ob in (obj_list or []) if ob.get("priority", None) is not None})
+            pr_sorted = [p for p in pr_sorted if p < 999999]
+        except Exception:
+            pr_sorted = []
+
+        def _coerce_prob(x):
+            try:
+                if x is None:
+                    return None
+                # se arriva un dict, provo a pescare un campo numerico
+                if isinstance(x, dict):
+                    for k in ("prob", "p", "value", "success_prob", "probability", "Probabilità di successo"):
+                        if k in x:
+                            x = x.get(k)
+                            break
+                return float(x)
+            except Exception:
+                return None
+
+        def _coerce_priority(d):
+            # prova a ricavare la priorità da un dict
+            if not isinstance(d, dict):
+                return None
+            for k in ("priority", "priorita", "priorità", "pmax", "priority_max",
+                      "Obiettivi fino a priorità", "Obiettivi fino alla priorità",
+                      "Obiettivi fino a priorità ", "Obiettivi fino alla priorità "):
+                if k in d:
+                    try:
+                        return int(d.get(k))
+                    except Exception:
+                        pass
+            return None
+
+        # 2) Caso dict
+        if isinstance(probs_by_pr, dict):
+            # se non ho pr_sorted, lo inferisco dalle chiavi del dict
+            if not pr_sorted:
+                try:
+                    pr_sorted = sorted({int(k) for k in probs_by_pr.keys()})
+                except Exception:
+                    pr_sorted = []
+
+            for pr in pr_sorted:
+                p = probs_by_pr.get(pr, None)
+                if p is None:
+                    p = probs_by_pr.get(str(pr), None)
+                out.append((f"Obiettivi fino alla priorità {pr}", _coerce_prob(p)))
+            return out
+
+        # 3) Caso list
+        if isinstance(probs_by_pr, list):
+            # 3a) list[dict]
+            if len(probs_by_pr) > 0 and isinstance(probs_by_pr[0], dict):
+                lookup = {}
+                pr_found = []
+                for d in probs_by_pr:
+                    pr = _coerce_priority(d)
+                    if pr is None:
+                        continue
+                    pr_found.append(pr)
+                    # valore probabilità
+                    pv = None
+                    for k in ("prob", "p", "value", "success_prob", "probability", "Probabilità di successo"):
+                        if k in d:
+                            pv = d.get(k)
+                            break
+                    lookup[int(pr)] = _coerce_prob(pv)
+                if not pr_sorted:
+                    pr_sorted = sorted(set(pr_found))
+                for pr in pr_sorted:
+                    out.append((f"Obiettivi fino alla priorità {pr}", lookup.get(int(pr), None)))
+                return out
+
+            # 3b) list[float] (già ordinata per priorità crescente)
+            if not pr_sorted:
+                # se non ho pr_sorted, uso un indice 1..n
+                pr_sorted = list(range(1, len(probs_by_pr) + 1))
+            for i, pr in enumerate(pr_sorted):
+                p = probs_by_pr[i] if i < len(probs_by_pr) else None
+                out.append((f"Obiettivi fino alla priorità {pr}", _coerce_prob(p)))
+            return out
+
+        return out
+
+    def _simulate_portfolio_success_prob(
+        mu_ann, vol_ann, corr_ann, weights, months, scen, seed, cf_monthly
+    ):
+        """Monte Carlo: successo = wealth non diventa mai negativo."""
+        mu_ann = np.asarray(mu_ann, dtype=float).reshape(-1)
+        vol_ann = np.asarray(vol_ann, dtype=float).reshape(-1)
+        corr_ann = np.asarray(corr_ann, dtype=float)
+        n = mu_ann.shape[0]
+        if corr_ann.shape != (n, n):
+            corr_ann = np.eye(n)
+
+        w = np.asarray(weights, dtype=float).reshape(-1)
+        if w.shape[0] != n:
+            # fallback: pesi uguali
+            w = np.ones(n, dtype=float) / float(n)
+        if np.sum(np.abs(w)) == 0:
+            w = np.ones(n, dtype=float) / float(n)
+        else:
+            w = w / np.sum(np.abs(w))
+
+        mu_m = np.power(1.0 + mu_ann, 1.0 / 12.0) - 1.0
+        vol_m = vol_ann / np.sqrt(12.0)
+        cov_m = np.outer(vol_m, vol_m) * corr_ann
+
+        rng = np.random.default_rng(int(seed))
+        try:
+            L = np.linalg.cholesky(cov_m)
+        except np.linalg.LinAlgError:
+            L = np.linalg.cholesky(cov_m + np.eye(n) * 1e-10)
+
+        Z = rng.standard_normal(size=(int(scen), int(months), n))
+        R = (Z @ L.T) + mu_m  # (scen, months, n)
+        R = np.maximum(R, -0.9999)
+
+        # rendimento portafoglio per mese
+        rp = np.sum(R * w.reshape(1, 1, -1), axis=2)  # (scen, months)
+
+        wealth = np.full(int(scen), float(cf_monthly.get("w0", 0.0)), dtype=float)
+        min_w = wealth.copy()
+        cf = np.asarray(cf_monthly.get("cf", np.zeros(int(months), dtype=float)), dtype=float).reshape(-1)
+        if cf.shape[0] < int(months):
+            cf = np.pad(cf, (0, int(months) - cf.shape[0]), constant_values=0.0)
+
+        for t in range(int(months)):
+            wealth = wealth * (1.0 + rp[:, t]) + cf[t]
+            min_w = np.minimum(min_w, wealth)
+
+        success = (min_w >= 0.0)
+        return float(np.mean(success))
+
+    if _is_goal_based(payload):
+        st.markdown("## Verifica degli Obiettivi di Spesa")
+
+        obj_list = payload.get("gbi_objectives") if isinstance(payload.get("gbi_objectives"), list) else []
+
+        colL, colR = st.columns(2)
+
+        # -------------------------
+        # (1) Probabilità iniziali
+        # -------------------------
+        with colL:
+            st.markdown("### Probabilità iniziali")
+            _render_prob_row("Probabilità di successo (tutti gli obiettivi)", payload.get("gbi_best_success_prob"))
+            init_pr = _extract_priority_probs(obj_list, payload.get("gbi_success_probs_by_priority"))
+            if init_pr:
+                st.markdown("**Probabilità di successo per obiettivi cumulati (per priorità)**")
+                for lab, pval in init_pr:
+                    _render_prob_row(lab, pval)
+            else:
+                st.caption("Probabilità per priorità non disponibili nel salvataggio.")
+
+        # -------------------------
+        # (2) Nuove probabilità (Monte Carlo residuo)
+        # -------------------------
+        with colR:
+            st.markdown("### Nuove Probabilità")
+
+            # Input mercati (attesi/vol/corr)
+            asset_inputs = payload.get("asset_inputs") or {
+                "exp_returns_ann": payload.get("exp_returns_ann"),
+                "vol_ann": payload.get("vol_ann"),
+                "corr_ann": payload.get("corr_ann"),
+            }
+
+            exp_ann = asset_inputs.get("exp_returns_ann")
+            vol_ann = asset_inputs.get("vol_ann")
+            corr_ann = asset_inputs.get("corr_ann")
+
+            # Normalizzazione input (dict o list)
+            asset_names = asset_inputs.get("asset_names") or payload.get("asset_names")
+            if isinstance(exp_ann, dict):
+                assets = list(exp_ann.keys())
+                mu = np.array([exp_ann[a] for a in assets], dtype=float)
+                if isinstance(vol_ann, dict):
+                    sig = np.array([vol_ann.get(a, np.nan) for a in assets], dtype=float)
+                else:
+                    sig = np.asarray(vol_ann, dtype=float).reshape(-1)
+            else:
+                mu = np.asarray(exp_ann, dtype=float).reshape(-1)
+                sig = np.asarray(vol_ann, dtype=float).reshape(-1)
+                assets = list(asset_names) if isinstance(asset_names, (list, tuple)) and len(asset_names) == len(mu) else [f"Asset {i+1}" for i in range(len(mu))]
+
+            if corr_ann is None:
+                corr = np.eye(len(mu))
+            else:
+                corr = np.asarray(corr_ann, dtype=float)
+
+            # Pesi: uso composition (target) come proxy
+            comp = payload.get("composition")
+            if isinstance(comp, dict):
+                w = np.array([float(comp.get(a, 0.0) or 0.0) for a in assets], dtype=float)
+            elif isinstance(comp, (list, tuple)) and len(comp) == len(mu):
+                w = np.asarray(comp, dtype=float)
+            else:
+                w = np.ones(len(mu), dtype=float) / float(len(mu) if len(mu) > 0 else 1)
+
+            # Orizzonte residuo (mesi)
+            T_years = int(payload.get("horizon_years", 0) or 0)
+            elapsed_m = int(round(float(elapsed_years_now) * 12.0)) if "elapsed_years_now" in locals() else 0
+            total_m = max(int(T_years * 12), 0)
+            resid_m = max(total_m - max(elapsed_m, 0), 1)
+
+            # Cashflow residui mensili
+            cf = np.zeros(int(resid_m), dtype=float)
+
+            # Conferimenti periodici residuali
+            periodic_amount = float(payload.get("periodic_amount", 0.0) or 0.0)
+            periodic_years = int(payload.get("periodic_years", 0) or 0)
+            freq = str(payload.get("periodic_freq", "Annuale") or "Annuale").strip().lower()
+
+            if freq.startswith("mens"):
+                freq_m = 1
+            elif freq.startswith("trim"):
+                freq_m = 3
+            elif freq.startswith("sem"):
+                freq_m = 6
+            else:
+                freq_m = 12
+
+            max_contrib_m = int(periodic_years * 12)
+            if periodic_amount != 0.0 and max_contrib_m > 0:
+                for t in range(1, int(resid_m) + 1):
+                    glob_m = elapsed_m + t
+                    if glob_m <= max_contrib_m and (glob_m % freq_m == 0):
+                        cf[t-1] += abs(periodic_amount)
+
+            # Spese residuali (GBI) dai schedule
+            def _schedule_month(entry: dict):
+                if isinstance(entry, dict):
+                    if entry.get("month") is not None:
+                        return int(entry.get("month", 0))
+                    if entry.get("m") is not None:
+                        return int(entry.get("m", 0))
+                    if entry.get("year") is not None:
+                        return int(entry.get("year", 0)) * 12
+                return 0
+
+            def _schedule_amount(entry: dict):
+                try:
+                    return float(entry.get("amount", entry.get("amt", entry.get("importo", 0.0))) or 0.0)
+                except Exception:
+                    return 0.0
+
+            for ob in obj_list or []:
+                for s in ob.get("schedule", []) or []:
+                    try:
+                        m_abs = _schedule_month(s)
+                        if m_abs <= elapsed_m:
+                            continue
+                        t = m_abs - elapsed_m
+                        if 1 <= t <= resid_m:
+                            cf[t-1] -= abs(_schedule_amount(s))
+                    except Exception:
+                        pass
+
+            # wealth iniziale = montante ad oggi
+            try:
+                w0 = float(current_wealth)
+            except Exception:
+                w0 = None
+
+            if w0 is None or len(mu) == 0 or exp_ann is None or vol_ann is None:
+                st.caption("Impossibile calcolare le nuove probabilità: dati di input insufficienti (montante ad oggi / rendimenti attesi / volatilità / correlazioni).")
+            else:
+                base_seed = 12345
+                p_all = _simulate_portfolio_success_prob(mu, sig, corr, w, resid_m, 1000, base_seed, {"w0": w0, "cf": cf})
+                _render_prob_row("Nuova Probabilità di successo (tutti gli obiettivi)", p_all)
+
+                # per priorità: includo progressivamente solo gli obiettivi con priorità <= soglia
+                pr_sorted = sorted({int(ob.get("priority", 999999)) for ob in (obj_list or [])})
+                if pr_sorted:
+                    st.markdown("**Nuove Probabilità di successo per obiettivi cumulati (per priorità)**")
+                    for pr in pr_sorted:
+                        cf_pr = np.zeros(int(resid_m), dtype=float)
+                        cf_pr[:] = cf  # base: include già tutte le spese; ricostruisco includendo solo <= pr
+                        # ricostruisco da zero: conferimenti + spese solo <=pr
+                        cf_pr = np.zeros(int(resid_m), dtype=float)
+                        cf_pr += cf * 0.0
+                        # conferimenti
+                        if periodic_amount != 0.0 and max_contrib_m > 0:
+                            for t in range(1, int(resid_m) + 1):
+                                glob_m = elapsed_m + t
+                                if glob_m <= max_contrib_m and (glob_m % freq_m == 0):
+                                    cf_pr[t-1] += abs(periodic_amount)
+                        # spese <= pr
+                        for ob in obj_list or []:
+                            try:
+                                if int(ob.get("priority", 999999)) > int(pr):
+                                    continue
+                            except Exception:
+                                continue
+                            for s in ob.get("schedule", []) or []:
+                                try:
+                                    m_abs = _schedule_month(s)
+                                    if m_abs <= elapsed_m:
+                                        continue
+                                    t = m_abs - elapsed_m
+                                    if 1 <= t <= resid_m:
+                                        cf_pr[t-1] -= abs(_schedule_amount(s))
+                                except Exception:
+                                    pass
+                        p_pr = _simulate_portfolio_success_prob(mu, sig, corr, w, resid_m, 1000, base_seed, {"w0": w0, "cf": cf_pr})
+                        _render_prob_row(f"Priorità ≤ {pr}", p_pr)
+                else:
+                    st.caption("Priorità degli obiettivi non disponibili.")
 # =======================
 # Crea Soluzione di Investimento → Asset-Only
 # =======================
@@ -10509,6 +11089,7 @@ def render_crea_soluzione_gbi():
 # =======================
 ensure_anagrafica_storage()
 main_section, tools_sub, crea_sub = top_nav_controls()
+render_sidebar_index(main_section, tools_sub, crea_sub)
 
 # =======================
 # Header (sempre definito)
@@ -10570,6 +11151,10 @@ else:
 # =======================
 # Breadcrumb (dinamico)
 # =======================
+# --- UX: descrizione in modalità compatta (solo UI, nessun impatto su logiche/calcoli)
+_header_desc_full = header_desc
+header_desc_html = "" if st.session_state.get("compact_ui", True) else header_desc
+
 if main_section == "Tools":
     breadcrumb_html = f'<span>Tools</span><div class="uw-dot"></div><span>{tools_sub}</span>'
 elif main_section == "Crea Soluzione di Investimento":
@@ -10591,7 +11176,7 @@ st.markdown(
         <div class="uw-shell-header">
           <div class="uw-title">
             <h1>{header_title} <span class="uw-badge">UI</span></h1>
-            <p>{header_desc}</p>
+            <p>{header_desc_html}</p>
           </div>
         </div>
       </div>
@@ -10599,6 +11184,11 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# Descrizione/guida rapida in expander (modalità compatta)
+if st.session_state.get("compact_ui", True) and _header_desc_full:
+    with st.expander("Guida rapida", expanded=False):
+        st.markdown(_header_desc_full, unsafe_allow_html=True)
 
 st.markdown('<div class="uw-content">', unsafe_allow_html=True)
 
